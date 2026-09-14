@@ -84,7 +84,7 @@ def probe(url: str, prefix: str | None, session: requests.Session) -> None:
     print(f"  -> pipeline would record: {classify(r)}")
 
 
-def urls_from_papers(path: Path, n: int) -> list:
+def urls_from_papers(path: Path, n: int) -> list[str]:
     if not path.exists():
         sys.exit(f"{path} not found. Run the pipeline first, or pass URLs directly.")
     out = []

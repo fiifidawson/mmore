@@ -128,9 +128,7 @@ def _proxify(url: str, prefix: str | None) -> str:
 
 def _looks_like_pdf(response: requests.Response) -> bool:
     ctype = response.headers.get("Content-Type", "").lower()
-    if "pdf" in ctype:
-        return True
-    if response.url.lower().endswith(".pdf"):
+    if "pdf" in ctype or response.url.lower().endswith(".pdf"):
         return True
     return response.content[:5] == b"%PDF-"
 

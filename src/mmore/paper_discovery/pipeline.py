@@ -204,7 +204,7 @@ class PaperDiscoveryPipeline:
         )
 
 
-def _load_categories(path: str) -> dict:
+def _load_categories(path: str) -> dict[str, list[str]]:
     """Read `categories.yaml`, validated through the `CategoriesFile` dataclass."""
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
