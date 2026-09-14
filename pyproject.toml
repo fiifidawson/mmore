@@ -177,6 +177,7 @@ websearch = [
 paper_discovery = [
     "mmore[process]",
     "requests>=2.31",
+    "beautifulsoup4>=4.13",
 ]
 
 dev = ["pytest>=8.3.4", "pytest-timeout>=2.3.1", "ruff>=0.4.0", "pyright"]
