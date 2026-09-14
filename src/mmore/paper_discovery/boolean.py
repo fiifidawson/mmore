@@ -30,6 +30,7 @@ def load_synonyms(path: str | Path) -> list[SynonymEntry]:
         `synonyms` value. Synonyms can be a list, or one string separated
         by commas or semicolons.
 
+            Examples:
             {"word": "Foundation model", "synonyms": ["LLM", "GPT"]}
             {"word": "Crisis response", "synonyms": "aid; disaster relief"}
 
