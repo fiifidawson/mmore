@@ -2,6 +2,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from mmore.paper_discovery.boolean import (
     _sanitize_term,
@@ -10,6 +11,7 @@ from mmore.paper_discovery.boolean import (
 )
 from mmore.paper_discovery.config import PaperDiscoveryConfig
 from mmore.paper_discovery.pdf import (
+    MAX_RETRIES,
     DownloadResult,
     _find_pdf_link,
     _looks_like_login_page,
@@ -19,7 +21,7 @@ from mmore.paper_discovery.pdf import (
     expected_pdf_path,
 )
 from mmore.paper_discovery.pipeline import PaperDiscoveryPipeline, _dedupe
-from mmore.paper_discovery.schema import Paper, SourceName, SynonymEntry
+from mmore.paper_discovery.schema import Paper, PdfStatus, SourceName, SynonymEntry
 from mmore.paper_discovery.sources._utils import (
     coerce_year,
     first_year,
@@ -229,7 +231,7 @@ class TestDownloadPdf:
         with patch("mmore.paper_discovery.pdf.requests.get", return_value=login):
             result = download_pdf("https://example.org/paper.pdf", str(tmp_path))
         assert result.path is None
-        assert result.login_page
+        assert result.outcome == PdfStatus.LOGIN_PAGE
         assert not any(tmp_path.iterdir())
 
     def _landing_then_pdf(self, final_url):
@@ -309,7 +311,7 @@ class TestEnrichWithPdfText:
             path = expected_pdf_path(cache_key or url, save_dir)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"%PDF-1.7\n")
-            return DownloadResult(path=str(path))
+            return DownloadResult(PdfStatus.DOWNLOADED, path=str(path))
 
         return fake
 
@@ -326,7 +328,7 @@ class TestEnrichWithPdfText:
             self._pipeline(tmp_path)._enrich_with_pdf_text([paper])
         assert paper.extracted_text is None
         assert "0/1 succeeded" in caplog.text
-        assert "1 with no text" in caplog.text
+        assert "1 no text" in caplog.text
 
     def test_non_pdf_cache_file_is_replaced(self, tmp_path, caplog):
         pipeline = self._pipeline(tmp_path)
@@ -391,11 +393,11 @@ class TestTryEveryUrl:
 
         def fake(url, save_dir, cache_key=None, **kwargs):
             if url == "https://example.org/oa.pdf":
-                return DownloadResult(errored=True)
+                return DownloadResult(PdfStatus.NETWORK_ERROR)
             path = expected_pdf_path(cache_key or url, save_dir)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"%PDF-1.7\n")
-            return DownloadResult(path=str(path))
+            return DownloadResult(PdfStatus.DOWNLOADED, path=str(path))
 
         download = MagicMock(side_effect=fake)
         with (
@@ -761,3 +763,171 @@ class TestArxivDoi:
         (p,) = _parse_atom(xml, "Cat")
         assert p.doi == "10.1/a"
         assert p.candidate_urls == ["http://arxiv.org/pdf/1", "http://arxiv.org/abs/1"]
+
+
+# ---------------------------------------------------------------------------
+# Failure outcomes and retries
+# ---------------------------------------------------------------------------
+
+
+def _response(status=200, content=b"%PDF-1.7\n", ctype="application/pdf", headers=None):
+    r = MagicMock(status_code=status, url="https://example.org/a.pdf")
+    r.content = content
+    r.text = content.decode("utf-8", errors="ignore")
+    r.headers = {"Content-Type": ctype, **(headers or {})}
+    return r
+
+
+class TestDownloadOutcomes:
+    @pytest.mark.parametrize(
+        "status, outcome",
+        [
+            (401, PdfStatus.REFUSED),
+            (403, PdfStatus.REFUSED),
+            (404, PdfStatus.NOT_FOUND),
+            (410, PdfStatus.NOT_FOUND),
+            (418, PdfStatus.HTTP_ERROR),
+        ],
+    )
+    def test_status_codes_map_to_outcomes(self, tmp_path, status, outcome):
+        with patch(
+            "mmore.paper_discovery.pdf.requests.get", return_value=_response(status)
+        ):
+            result = download_pdf("https://example.org/a.pdf", str(tmp_path))
+        assert result.outcome == outcome
+        assert result.status == status
+        assert result.path is None
+
+    def test_success_is_downloaded(self, tmp_path):
+        with patch("mmore.paper_discovery.pdf.requests.get", return_value=_response()):
+            result = download_pdf("https://example.org/a.pdf", str(tmp_path))
+        assert result.outcome == PdfStatus.DOWNLOADED
+        assert result.path
+
+    def test_landing_page_without_a_pdf_link(self, tmp_path):
+        page = _response(content=b"<html>no links</html>", ctype="text/html")
+        with patch("mmore.paper_discovery.pdf.requests.get", return_value=page):
+            result = download_pdf("https://example.org/article", str(tmp_path))
+        assert result.outcome == PdfStatus.NO_PDF_LINK
+
+    def test_pdf_link_that_is_not_a_pdf(self, tmp_path):
+        page = _response(content=b'<a href="/x/pdf">PDF</a>', ctype="text/html")
+        html = _response(content=b"<html>viewer</html>", ctype="text/html")
+        with patch("mmore.paper_discovery.pdf.requests.get", side_effect=[page, html]):
+            result = download_pdf("https://example.org/article", str(tmp_path))
+        assert result.outcome == PdfStatus.NOT_PDF
+
+    def test_network_error_is_not_retried(self, tmp_path):
+        get = MagicMock(side_effect=requests.ConnectionError("dns"))
+        with patch("mmore.paper_discovery.pdf.requests.get", get):
+            result = download_pdf("https://example.org/a.pdf", str(tmp_path))
+        assert result.outcome == PdfStatus.NETWORK_ERROR
+        assert get.call_count == 1
+
+
+class TestDownloadRetries:
+    def test_server_error_is_retried(self, tmp_path):
+        get = MagicMock(side_effect=[_response(503), _response()])
+        with (
+            patch("mmore.paper_discovery.pdf.requests.get", get),
+            patch("mmore.paper_discovery.pdf.time.sleep") as sleep,
+        ):
+            result = download_pdf("https://example.org/a.pdf", str(tmp_path))
+        assert result.outcome == PdfStatus.DOWNLOADED
+        assert get.call_count == 2
+        sleep.assert_called_once()
+
+    def test_rate_limit_honours_retry_after(self, tmp_path):
+        limited = _response(429, headers={"Retry-After": "5"})
+        get = MagicMock(side_effect=[limited, _response()])
+        with (
+            patch("mmore.paper_discovery.pdf.requests.get", get),
+            patch("mmore.paper_discovery.pdf.time.sleep") as sleep,
+        ):
+            result = download_pdf("https://example.org/a.pdf", str(tmp_path))
+        assert result.outcome == PdfStatus.DOWNLOADED
+        sleep.assert_called_once_with(5.0)
+
+    def test_persistent_rate_limit_is_reported(self, tmp_path):
+        get = MagicMock(return_value=_response(429))
+        with (
+            patch("mmore.paper_discovery.pdf.requests.get", get),
+            patch("mmore.paper_discovery.pdf.time.sleep"),
+        ):
+            result = download_pdf("https://example.org/a.pdf", str(tmp_path))
+        assert result.outcome == PdfStatus.RATE_LIMITED
+        assert get.call_count == MAX_RETRIES + 1
+
+    def test_persistent_timeout_is_reported(self, tmp_path):
+        get = MagicMock(side_effect=requests.Timeout())
+        with (
+            patch("mmore.paper_discovery.pdf.requests.get", get),
+            patch("mmore.paper_discovery.pdf.time.sleep"),
+        ):
+            result = download_pdf("https://example.org/a.pdf", str(tmp_path))
+        assert result.outcome == PdfStatus.TIMEOUT
+        assert get.call_count == MAX_RETRIES + 1
+
+    def test_refused_is_not_retried(self, tmp_path):
+        get = MagicMock(return_value=_response(403))
+        with patch("mmore.paper_discovery.pdf.requests.get", get):
+            download_pdf("https://example.org/a.pdf", str(tmp_path))
+        assert get.call_count == 1
+
+
+class TestPipelineOutcomes:
+    def _pipeline(self, tmp_path, **kwargs):
+        cfg = PaperDiscoveryConfig(
+            synonyms_path="unused",
+            categories_path="unused",
+            output_file=str(tmp_path / "out.jsonl"),
+            pdf_dir=str(tmp_path / "pdfs"),
+            **kwargs,
+        )
+        return PaperDiscoveryPipeline(cfg)
+
+    def test_refusal_is_reported_over_a_page_with_no_link(self, tmp_path, caplog):
+        paper = Paper(title="T", candidate_urls=["https://a.org/1", "https://b.org/1"])
+        results = [
+            DownloadResult(PdfStatus.REFUSED, status=403),
+            DownloadResult(PdfStatus.NO_PDF_LINK, status=200),
+        ]
+        with (
+            patch("mmore.paper_discovery.pipeline.download_pdf", side_effect=results),
+            caplog.at_level("INFO"),
+        ):
+            self._pipeline(tmp_path)._enrich_with_pdf_text([paper])
+        assert "0/1 succeeded" in caplog.text
+        assert "Not downloaded: 1 refused" in caplog.text
+
+    def test_counts_each_outcome(self, tmp_path, caplog):
+        papers = [
+            Paper(title="A", url="https://a.org/1"),
+            Paper(title="B", url="https://b.org/1"),
+            Paper(title="C"),
+        ]
+        results = [
+            DownloadResult(PdfStatus.NOT_FOUND, status=404),
+            DownloadResult(PdfStatus.TIMEOUT),
+        ]
+        with (
+            patch("mmore.paper_discovery.pipeline.download_pdf", side_effect=results),
+            caplog.at_level("INFO"),
+        ):
+            self._pipeline(tmp_path)._enrich_with_pdf_text(papers)
+        assert "0/3 succeeded" in caplog.text
+        assert "1 no url, 1 not found, 1 timeout" in caplog.text
+        assert "Raise `pdf_timeout`" in caplog.text
+
+    def test_doi_without_links_is_no_url(self, tmp_path, caplog):
+        with caplog.at_level("INFO"):
+            self._pipeline(tmp_path)._enrich_with_pdf_text([Paper(doi="10.1/a")])
+        assert "1 no url" in caplog.text
+
+    def test_pdf_timeout_is_passed_on(self, tmp_path):
+        download = MagicMock(return_value=DownloadResult(PdfStatus.TIMEOUT))
+        with patch("mmore.paper_discovery.pipeline.download_pdf", download):
+            self._pipeline(tmp_path, pdf_timeout=90)._enrich_with_pdf_text(
+                [Paper(title="T", url="https://a.org/1")]
+            )
+        assert download.call_args.kwargs["timeout"] == 90

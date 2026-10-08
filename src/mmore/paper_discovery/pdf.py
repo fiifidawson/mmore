@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote, urljoin
@@ -9,12 +10,19 @@ from urllib.parse import quote, urljoin
 import requests
 from bs4 import BeautifulSoup
 
+from .schema import PdfStatus
+
 logger = logging.getLogger(__name__)
 
-# Status codes the publisher uses to say "you don't have access here."
-# These are expected on paywalled content and are reported as a summary,
-# not per-paper warnings.
-PAYWALL_STATUSES = {401, 402, 403, 429}
+# 401/402/403: no subscription, or the publisher blocks automated tools.
+# We can't tell these apart, so both are reported as "refused".
+REFUSED_STATUSES = {401, 402, 403}
+NOT_FOUND_STATUSES = {404, 410}
+
+# Timeouts, 429 and 5xx are often temporary, so they are retried.
+MAX_RETRIES = 2
+BACKOFF_SECONDS = 2.0
+MAX_RETRY_AFTER_SECONDS = 60.0
 
 # Substrings that mark an HTML body as a sign-in page rather than content.
 # A proxy that needs authentication answers 200 OK with one of these, which
@@ -33,11 +41,9 @@ LOGIN_PAGE_MARKERS = (
 class DownloadResult:
     """Outcome of a single PDF fetch. The pipeline tallies these at the end."""
 
+    outcome: PdfStatus
     path: str | None = None  # local file path on success
-    paywalled: bool = False  # publisher returned 401/402/403/429
-    errored: bool = False  # network/timeout/other, actionable
-    status: int | None = None  # last seen HTTP status, if any
-    login_page: bool = False  # got an auth page instead of the PDF
+    status: int | None = None  # last HTTP status seen, if any
 
 
 def download_pdf(
@@ -60,63 +66,107 @@ def download_pdf(
       cache_key: What to name the cached file after. Defaults to `url`.
 
     Returns:
-      A `DownloadResult` saying what happened, including whether the
-      publisher refused us and whether we hit a sign-in page.
+      A `DownloadResult` with the outcome and, on success, the file path.
     """
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     save_path = expected_pdf_path(cache_key or url, save_dir)
     headers = {"User-Agent": user_agent}
-    fetch_url = _proxify(url, proxy_prefix)
 
-    try:
-        r = requests.get(
-            fetch_url, headers=headers, timeout=timeout, allow_redirects=True
-        )
-    except requests.RequestException as e:
-        logger.debug("download_pdf network error for %s: %s", url, e)
-        return DownloadResult(errored=True)
-
-    if r.status_code in PAYWALL_STATUSES:
-        return DownloadResult(paywalled=True, status=r.status_code)
-
+    r = _get(_proxify(url, proxy_prefix), headers, timeout)
+    if isinstance(r, DownloadResult):
+        return r
     if r.status_code != 200:
-        logger.debug("download_pdf got %s for %s", r.status_code, url)
-        return DownloadResult(errored=True, status=r.status_code)
+        return _failed(r.status_code, url)
 
     if _looks_like_pdf(r):
-        return DownloadResult(path=_save_pdf(r.content, save_path))
-
+        return _saved(r.content, save_path)
     if _looks_like_login_page(r):
         logger.debug("download_pdf got a sign-in page for %s", url)
-        return DownloadResult(status=r.status_code, login_page=True)
+        return DownloadResult(PdfStatus.LOGIN_PAGE, status=r.status_code)
 
     # Relative links are relative to the page we ended up on after redirects,
     # e.g. the publisher's page a DOI link redirects to.
     pdf_url = _find_pdf_link(r.text, base=r.url)
     if not pdf_url:
-        return DownloadResult(status=r.status_code)
+        return DownloadResult(PdfStatus.NO_PDF_LINK, status=r.status_code)
 
-    try:
-        r2 = requests.get(
-            _proxify(pdf_url, proxy_prefix),
-            headers=headers,
-            timeout=timeout,
-            allow_redirects=True,
-        )
-    except requests.RequestException as e:
-        logger.debug("download_pdf follow-link error for %s: %s", pdf_url, e)
-        return DownloadResult(errored=True)
-
-    if r2.status_code in PAYWALL_STATUSES:
-        return DownloadResult(paywalled=True, status=r2.status_code)
-
-    if r2.status_code == 200 and _looks_like_pdf(r2):
+    r2 = _get(_proxify(pdf_url, proxy_prefix), headers, timeout)
+    if isinstance(r2, DownloadResult):
+        return r2
+    if r2.status_code != 200:
+        return _failed(r2.status_code, pdf_url)
+    if _looks_like_pdf(r2):
         # Saved under the paper's key, not the link we followed, so the
         # cache check finds it next time.
-        return DownloadResult(path=_save_pdf(r2.content, save_path))
+        return _saved(r2.content, save_path)
     if _looks_like_login_page(r2):
-        return DownloadResult(status=r2.status_code, login_page=True)
-    return DownloadResult(status=r2.status_code)
+        return DownloadResult(PdfStatus.LOGIN_PAGE, status=r2.status_code)
+    return DownloadResult(PdfStatus.NOT_PDF, status=r2.status_code)
+
+
+def _get(
+    url: str, headers: dict[str, str], timeout: int
+) -> "requests.Response | DownloadResult":
+    """GET with retries for timeouts, 429 and 5xx.
+
+    Returns the response, or a `DownloadResult` when the request never got
+    an answer. A 429 or 5xx that persists is returned as a response.
+    """
+    for attempt in range(MAX_RETRIES + 1):
+        last_try = attempt == MAX_RETRIES
+        try:
+            r = requests.get(
+                url, headers=headers, timeout=timeout, allow_redirects=True
+            )
+        except requests.Timeout:
+            logger.debug("download_pdf timed out for %s", url)
+            if last_try:
+                return DownloadResult(PdfStatus.TIMEOUT)
+            time.sleep(_backoff(attempt))
+            continue
+        except requests.RequestException as e:
+            logger.debug("download_pdf network error for %s: %s", url, e)
+            return DownloadResult(PdfStatus.NETWORK_ERROR)
+
+        if last_try or not (r.status_code == 429 or r.status_code >= 500):
+            return r
+        logger.debug("download_pdf got %s for %s, retrying", r.status_code, url)
+        time.sleep(_retry_after(r) or _backoff(attempt))
+    raise AssertionError("unreachable")
+
+
+def _backoff(attempt: int) -> float:
+    return BACKOFF_SECONDS * 2**attempt
+
+
+def _retry_after(response: requests.Response) -> float | None:
+    """Seconds asked for by a `Retry-After` header, capped. None if absent."""
+    try:
+        seconds = float(response.headers.get("Retry-After", ""))
+    except ValueError:
+        return None  # missing, or an HTTP date we don't parse
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
+
+
+def _failed(status: int, url: str) -> DownloadResult:
+    """Outcome for a non-200 response."""
+    logger.debug("download_pdf got %s for %s", status, url)
+    if status in REFUSED_STATUSES:
+        outcome = PdfStatus.REFUSED
+    elif status == 429:
+        outcome = PdfStatus.RATE_LIMITED
+    elif status in NOT_FOUND_STATUSES:
+        outcome = PdfStatus.NOT_FOUND
+    elif status >= 500:
+        outcome = PdfStatus.SERVER_ERROR
+    else:
+        outcome = PdfStatus.HTTP_ERROR
+    return DownloadResult(outcome, status=status)
+
+
+def _saved(content: bytes, path: Path) -> DownloadResult:
+    path.write_bytes(content)
+    return DownloadResult(PdfStatus.DOWNLOADED, path=str(path), status=200)
 
 
 def _proxify(url: str, prefix: str | None) -> str:
@@ -175,11 +225,6 @@ def expected_pdf_path(key: str, save_dir: str) -> Path:
     """
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     return Path(save_dir) / f"{digest}.pdf"
-
-
-def _save_pdf(content: bytes, path: Path) -> str:
-    path.write_bytes(content)
-    return str(path)
 
 
 def _find_pdf_link(html: str, base: str) -> str | None:
