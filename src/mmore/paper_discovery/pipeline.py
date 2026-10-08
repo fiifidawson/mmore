@@ -82,14 +82,34 @@ class PaperDiscoveryPipeline:
         }
         duplicates = sum(self.found.values()) - self.n_unique
         rows["unique"] = f"{self.n_unique} ({duplicates} duplicates removed)"
-        if self.pdf_counts:
-            with_text = sum(self.pdf_counts[s] for s in SUCCESS)
-            without = sum(self.pdf_counts.values()) - with_text
-            rows["full text"] = f"{with_text} papers · {without} without"
-        if self.failed_list:
-            rows["to download"] = str(self.failed_list)
+        counts = self.pdf_counts
+        if counts:
+            cached, new = counts[PdfStatus.CACHED], counts[PdfStatus.DOWNLOADED]
+            rows["full text"] = f"{cached + new} ({cached} cached · {new} new)"
+            missing = sorted(
+                ((s, n) for s, n in counts.items() if s not in SUCCESS and n),
+                key=lambda item: -item[1],
+            )
+            if missing:
+                rows["no full text"] = sum(n for _, n in missing)
+                for status, n in missing:
+                    rows[f"  · {_label(status)}"] = n
         rows["output"] = self.config.output_file
         return rows
+
+    def next_steps(self) -> dict[str, object]:
+        """What the user can do about missing PDFs. Empty if nothing."""
+        steps: dict[str, object] = {}
+        if self.failed_list:
+            n = sum(self.pdf_counts[s] for s in MANUAL_DOWNLOAD)
+            steps[f"{plural(n, 'PDF')} to get by hand"] = (
+                f"Open the links in {self.failed_list} in your browser, save "
+                "each PDF to its save_as path, then run again."
+            )
+        for status, hint in HINTS.items():
+            if self.pdf_counts[status]:
+                steps[f"{self.pdf_counts[status]} {_label(status)}"] = hint
+        return steps
 
     def _search(self, queries: list[CategoryQuery], out: list[Paper]) -> None:
         """Run every query on every source, adding results to `out`."""
@@ -140,7 +160,7 @@ class PaperDiscoveryPipeline:
                 )
                 bar.update()
         self.failed_list = self._write_failed_list(papers)
-        _log_pdf_summary(counts, self.failed_list)
+        _log_pdf_summary(counts)
 
     def _fetch_text(self, paper: Paper) -> PdfStatus:
         """Get the paper's PDF from the cache or the web, and extract its text.
@@ -292,6 +312,15 @@ TELLING_FAILURES = (PdfStatus.LOGIN_PAGE, PdfStatus.REFUSED, PdfStatus.RATE_LIMI
 # Failures a person can often fix by downloading the PDF in a browser.
 MANUAL_DOWNLOAD = set(PdfStatus) - SUCCESS - {PdfStatus.NO_TEXT}
 
+# What to do about outcomes that have a fix besides downloading by hand.
+HINTS = {
+    PdfStatus.LOGIN_PAGE: "Check pdf_proxy_prefix is your library's EZproxy, "
+    "or unset it and use the VPN.",
+    PdfStatus.RATE_LIMITED: "Run again later.",
+    PdfStatus.TIMEOUT: "Raise pdf_timeout for slow publishers.",
+    PdfStatus.NO_TEXT: "Probably scanned. Try pdf_extractor: full.",
+}
+
 
 def _set_status(
     paper: Paper, status: PdfStatus, http_status: int | None = None
@@ -300,15 +329,13 @@ def _set_status(
     return status
 
 
-def _log_pdf_summary(counts: "Counter[PdfStatus]", failed_list: Path | None) -> None:
-    """One summary line, then a hint for each failure the user can act on."""
+def _log_pdf_summary(counts: "Counter[PdfStatus]") -> None:
+    """One line with every outcome. Shown with MMORE_VERBOSE=1."""
     succeeded = counts[PdfStatus.DOWNLOADED] + counts[PdfStatus.CACHED]
     failures = ", ".join(
-        f"{counts[s]} {s.value.replace('_', ' ')}"
-        for s in PdfStatus
-        if s not in SUCCESS and counts[s]
+        f"{counts[s]} {_label(s)}" for s in PdfStatus if s not in SUCCESS and counts[s]
     )
-    logger.info(
+    logger.debug(
         "PDF download: %d/%d succeeded (%d cached, %d fresh)%s",
         succeeded,
         sum(counts.values()),
@@ -317,48 +344,10 @@ def _log_pdf_summary(counts: "Counter[PdfStatus]", failed_list: Path | None) -> 
         f". Not downloaded: {failures}" if failures else "",
     )
 
-    if counts[PdfStatus.NO_TEXT]:
-        logger.warning(
-            "%d PDFs gave no text. They may be scanned images. "
-            "Try `pdf_extractor: full`.",
-            counts[PdfStatus.NO_TEXT],
-        )
-    if counts[PdfStatus.LOGIN_PAGE]:
-        logger.warning(
-            "%d downloads returned a sign-in page instead of a PDF. "
-            "This pipeline cannot log in for you. If you set "
-            "`pdf_proxy_prefix`, check the host is your institution's "
-            "real EZproxy and that you can reach it. If your institution "
-            "grants access by VPN instead, unset `pdf_proxy_prefix` and "
-            "connect to the VPN.",
-            counts[PdfStatus.LOGIN_PAGE],
-        )
-    if counts[PdfStatus.REFUSED]:
-        logger.info(
-            "%d PDFs were refused by the publisher (401/402/403), after "
-            "trying free copies. Either there is no subscription, or the "
-            "publisher blocks automated tools. Being on the VPN does not "
-            "always help. Download them by hand (see below).",
-            counts[PdfStatus.REFUSED],
-        )
-    if counts[PdfStatus.RATE_LIMITED]:
-        logger.info(
-            "%d PDFs were still rate-limited (429) after retries. Rerun "
-            "later. PDFs already downloaded are reused.",
-            counts[PdfStatus.RATE_LIMITED],
-        )
-    if counts[PdfStatus.TIMEOUT]:
-        logger.info(
-            "%d PDFs timed out. Raise `pdf_timeout` for slow publishers or proxies.",
-            counts[PdfStatus.TIMEOUT],
-        )
-    if failed_list:
-        logger.info(
-            "To add the missing PDFs by hand: open each link in %s in your "
-            "browser, save the PDF to the path in its `save_as` column, then "
-            "run again. Saved PDFs are picked up automatically.",
-            failed_list,
-        )
+
+def _label(status: PdfStatus) -> str:
+    """`login_page` -> `login page`, for people to read."""
+    return status.value.replace("_", " ")
 
 
 def _load_categories(path: str) -> dict[str, list[str]]:

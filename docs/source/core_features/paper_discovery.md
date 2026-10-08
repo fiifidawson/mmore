@@ -94,22 +94,33 @@ See [`examples/paper_discovery/config.yaml`](https://github.com/EPFLiGHT/mmore/b
 python3 -m mmore paper-discovery --config-file examples/paper_discovery/config.yaml
 ```
 
-You see one line per stage, a progress bar while it runs, and a summary at the end:
+You see one line when the run starts, a progress bar for each stage, and a summary at the end. If some PDFs are missing, a short list of next steps follows:
 
 ```
 ▸ Paper Discovery 📄  Find papers for your keywords · sources: openalex, europepmc, arxiv
-  Searching ━━━━━━━━━━━━━━━━━━━━━━━━  6/6 search 100% 0:00:15  arxiv · Humanitarian AI Search
-  PDFs      ━━━━━━━━━━━━━━━━━━━━━━━━ 20/20 paper  100% 0:02:39  ok=11 cache=0 refused=9 failed=9
+  Searching ━━━━━━━━━━━━━━━━━━━━━━━━   6/6 search 100% 0:00:15  arxiv · Humanitarian AI Search
+  PDFs      ━━━━━━━━━━━━━━━━━━━━━━━━ 122/122 paper 100% 0:08:41  ok=68 cache=22 refused=41 failed=54
 
-┌─ mmore ▸ Paper Discovery 📄 · done in 175.2s ─────────────────────────────────────┐
-│ sources: openalex, europepmc, arxiv   openalex      8 papers                       │
-│ PDFs: on                              europepmc     8 papers                       │
-│                                       arxiv         8 papers                       │
-│                                       unique        20 (4 duplicates removed)      │
-│                                       full text     11 papers · 9 without          │
-│                                       to download   results/papers_failed_pdfs.csv │
-│                                       output        results/papers.jsonl           │
-└────────────────────────────────────────────────────────────────────────────────────┘
+╭─ mmore ▸ Paper Discovery 📄 · done in 175.2s ───────────────────────────────────────╮
+│ sources: openalex, europepmc, arxiv   openalex          50 papers                   │
+│ PDFs: on                              europepmc         48 papers                   │
+│                                       arxiv             50 papers                   │
+│                                       unique            122 (26 duplicates removed) │
+│                                       full text         68 (22 cached · 46 new)     │
+│                                       no full text      54                          │
+│                                         · refused       41                          │
+│                                         · no pdf link   8                           │
+│                                         · not pdf       2                           │
+│                                         · http error    2                           │
+│                                         · login page    1                           │
+│                                       output            results/papers.jsonl        │
+╰─────────────────────────────────────────────────────────────────────────────────────╯
+╭─ mmore ▸ Next steps ─────────────────────────────────────────────────────────────────────────────╮
+│ 54 PDFs to get by hand   Open the links in results/papers_failed_pdfs.csv in your browser, save  │
+│                          each PDF to its save_as path, then run again.                           │
+│ 1 login page             Check pdf_proxy_prefix is your library's EZproxy, or unset it and use   │
+│                          the VPN.                                                                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 Set `MMORE_VERBOSE=1` to also see each search and its result count.
@@ -166,13 +177,7 @@ The default just identifies mmore + the repo URL, which works but doesn't tell a
 
 ## 📥 PDF downloads
 
-Each paper's links are tried in order until one gives a PDF. A paper only counts as a success if text was extracted from it. The log line at the end of the PDF stage shows the split:
-
-```
-PDF download: 108/124 succeeded (45 cached, 63 fresh). Not downloaded: 12 refused, 2 not found, 1 timeout, 1 no text
-```
-
-Only the outcomes that happened are listed. Each paper's `pdf_status` uses the same names, with `_` instead of spaces:
+Each paper's links are tried in order until one gives a PDF. A paper only counts as a success if text was extracted from it. The summary card lists why the other PDFs are missing, largest group first. Only the outcomes that happened are listed. Each paper's `pdf_status` uses the same names, with `_` instead of spaces:
 
 | Outcome | Meaning |
 |---|---|

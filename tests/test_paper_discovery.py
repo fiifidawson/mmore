@@ -324,7 +324,7 @@ class TestEnrichWithPdfText:
                 side_effect=self._download_ok(tmp_path),
             ),
             patch("mmore.paper_discovery.pipeline.extract_text", return_value=""),
-            caplog.at_level("INFO"),
+            caplog.at_level("DEBUG"),
         ):
             self._pipeline(tmp_path)._enrich_with_pdf_text([paper])
         assert paper.extracted_text is None
@@ -343,7 +343,7 @@ class TestEnrichWithPdfText:
         with (
             patch("mmore.paper_discovery.pipeline.download_pdf", download),
             patch("mmore.paper_discovery.pipeline.extract_text", return_value="text"),
-            caplog.at_level("INFO"),
+            caplog.at_level("DEBUG"),
         ):
             pipeline._enrich_with_pdf_text([paper])
         download.assert_called_once()
@@ -363,7 +363,7 @@ class TestEnrichWithPdfText:
         with (
             patch("mmore.paper_discovery.pipeline.download_pdf", download),
             patch("mmore.paper_discovery.pipeline.extract_text", return_value="text"),
-            caplog.at_level("INFO"),
+            caplog.at_level("DEBUG"),
         ):
             pipeline._enrich_with_pdf_text([paper])
         download.assert_not_called()
@@ -404,7 +404,7 @@ class TestTryEveryUrl:
         with (
             patch("mmore.paper_discovery.pipeline.download_pdf", download),
             patch("mmore.paper_discovery.pipeline.extract_text", return_value="text"),
-            caplog.at_level("INFO"),
+            caplog.at_level("DEBUG"),
         ):
             pipeline._enrich_with_pdf_text([paper])
         assert download.call_count == 2
@@ -895,7 +895,7 @@ class TestPipelineOutcomes:
         ]
         with (
             patch("mmore.paper_discovery.pipeline.download_pdf", side_effect=results),
-            caplog.at_level("INFO"),
+            caplog.at_level("DEBUG"),
         ):
             self._pipeline(tmp_path)._enrich_with_pdf_text([paper])
         assert "0/1 succeeded" in caplog.text
@@ -913,15 +913,18 @@ class TestPipelineOutcomes:
         ]
         with (
             patch("mmore.paper_discovery.pipeline.download_pdf", side_effect=results),
-            caplog.at_level("INFO"),
+            caplog.at_level("DEBUG"),
         ):
-            self._pipeline(tmp_path)._enrich_with_pdf_text(papers)
+            pipeline = self._pipeline(tmp_path)
+            pipeline._enrich_with_pdf_text(papers)
         assert "0/3 succeeded" in caplog.text
         assert "1 no url, 1 not found, 1 timeout" in caplog.text
-        assert "Raise `pdf_timeout`" in caplog.text
+        assert pipeline.next_steps()["1 timeout"] == (
+            "Raise pdf_timeout for slow publishers."
+        )
 
     def test_doi_without_links_is_no_url(self, tmp_path, caplog):
-        with caplog.at_level("INFO"):
+        with caplog.at_level("DEBUG"):
             self._pipeline(tmp_path)._enrich_with_pdf_text([Paper(doi="10.1/a")])
         assert "1 no url" in caplog.text
 
@@ -1102,5 +1105,22 @@ class TestRunSummary:
         )
         pipeline.failed_list = tmp_path / "papers_failed_pdfs.csv"
         summary = pipeline.summary()
-        assert summary["full text"] == "2 papers · 1 without"
-        assert summary["to download"] == str(pipeline.failed_list)
+        assert summary["full text"] == "2 (1 cached · 1 new)"
+        assert summary["no full text"] == 1
+        assert summary["  · refused"] == 1
+
+        steps = pipeline.next_steps()
+        assert str(pipeline.failed_list) in str(steps["1 PDF to get by hand"])
+
+    def test_missing_breakdown_is_largest_first(self, tmp_path):
+        pipeline = PaperDiscoveryPipeline(_config(tmp_path))
+        pipeline.pdf_counts.update(
+            {PdfStatus.LOGIN_PAGE: 1, PdfStatus.REFUSED: 5, PdfStatus.NOT_PDF: 2}
+        )
+        rows = [k for k in pipeline.summary() if k.startswith("  · ")]
+        assert rows == ["  · refused", "  · not pdf", "  · login page"]
+
+    def test_no_next_steps_when_everything_worked(self, tmp_path):
+        pipeline = PaperDiscoveryPipeline(_config(tmp_path))
+        pipeline.pdf_counts.update({PdfStatus.DOWNLOADED: 3})
+        assert pipeline.next_steps() == {}
