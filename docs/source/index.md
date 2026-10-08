@@ -87,7 +87,7 @@ Here is a quick overview of the main pages:
 - [RAG](getting_started/rag.md): structure retrieval-augmented generation workflows
 - [ColVision](core_features/colvision.md): multimodal retrieval-related documentation
 - [Websearch](core_features/websearch.md): web search integration and related workflows
-- [Paper Discovery](core_features/paper_discovery.md): fetch academic papers from OpenAlex, Europe PMC, arXiv, and Google Scholar
+- [Paper Discovery](core_features/paper_discovery.md): find academic papers on OpenAlex, Europe PMC, arXiv and Google Scholar, and download their PDFs, free copies first
 - [Evaluation](core_features/evaluation.md): assess system performance
 - [LLM as a judge](core_features/llm_as_a_judge.md): corrective retrieval with an LLM judge
 - [Privacy mode](core_features/privacy_mode.md): sanitize retrieved context before it reaches the answer model

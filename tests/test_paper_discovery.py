@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -931,3 +932,175 @@ class TestPipelineOutcomes:
                 [Paper(title="T", url="https://a.org/1")]
             )
         assert download.call_args.kwargs["timeout"] == 90
+
+
+# ---------------------------------------------------------------------------
+# Per-paper status, manual-download list and run summary
+# ---------------------------------------------------------------------------
+
+
+def _config(tmp_path, **kwargs):
+    return PaperDiscoveryConfig(
+        synonyms_path=str(tmp_path / "synonyms.jsonl"),
+        categories_path=str(tmp_path / "categories.yaml"),
+        output_file=str(tmp_path / "out" / "papers.jsonl"),
+        pdf_dir=str(tmp_path / "pdfs"),
+        **kwargs,
+    )
+
+
+def _fake_download(outcomes):
+    """A `download_pdf` stand-in: `outcomes` maps a URL to a status code,
+    or to None to "download" a real-looking PDF."""
+
+    def fake(url, save_dir, cache_key=None, **kwargs):
+        status = outcomes[url]
+        if status is not None:
+            return DownloadResult(PdfStatus.REFUSED, status=status)
+        path = expected_pdf_path(cache_key or url, save_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"%PDF-1.7\n")
+        return DownloadResult(PdfStatus.DOWNLOADED, path=str(path), status=200)
+
+    return fake
+
+
+class TestPerPaperStatus:
+    def test_each_paper_records_what_happened(self, tmp_path):
+        ok = Paper(title="A", url="https://a.org/1.pdf")
+        refused = Paper(title="B", url="https://b.org/1.pdf")
+        no_url = Paper(title="C")
+        with (
+            patch(
+                "mmore.paper_discovery.pipeline.download_pdf",
+                side_effect=_fake_download(
+                    {"https://a.org/1.pdf": None, "https://b.org/1.pdf": 403}
+                ),
+            ),
+            patch("mmore.paper_discovery.pipeline.extract_text", return_value="text"),
+        ):
+            PaperDiscoveryPipeline(_config(tmp_path))._enrich_with_pdf_text(
+                [ok, refused, no_url]
+            )
+        assert (ok.pdf_status, ok.pdf_http_status) == (PdfStatus.DOWNLOADED, 200)
+        assert (refused.pdf_status, refused.pdf_http_status) == (
+            PdfStatus.REFUSED,
+            403,
+        )
+        assert (no_url.pdf_status, no_url.pdf_http_status) == (PdfStatus.NO_URL, None)
+
+    def test_status_is_written_as_plain_text(self):
+        paper = Paper(pdf_status=PdfStatus.REFUSED, pdf_http_status=403)
+        line = json.loads(json.dumps(paper.to_dict()))
+        assert line["pdf_status"] == "refused"
+        assert line["pdf_http_status"] == 403
+
+
+class TestFailedPdfList:
+    def _run(self, tmp_path, papers, outcomes, text="text"):
+        pipeline = PaperDiscoveryPipeline(_config(tmp_path))
+        with (
+            patch(
+                "mmore.paper_discovery.pipeline.download_pdf",
+                side_effect=_fake_download(outcomes),
+            ),
+            patch("mmore.paper_discovery.pipeline.extract_text", return_value=text),
+        ):
+            pipeline._enrich_with_pdf_text(papers)
+        return pipeline
+
+    def _rows(self, path):
+        import csv
+
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f))
+
+    def test_lists_failed_papers_with_a_link_and_save_path(self, tmp_path):
+        paper = Paper(title="Paywalled", doi="10.1/a", url="https://pub.org/1.pdf")
+        pipeline = self._run(tmp_path, [paper], {"https://pub.org/1.pdf": 403})
+        assert pipeline.failed_list is not None
+        (row,) = self._rows(pipeline.failed_list)
+        assert row["title"] == "Paywalled"
+        assert row["status"] == "refused"
+        assert row["http_status"] == "403"
+        assert row["link"] == "https://doi.org/10.1/a"
+        expected = expected_pdf_path("doi:10.1/a", pipeline.config.pdf_dir)
+        assert row["save_as"] == str(expected.resolve())
+
+    def test_saved_pdf_is_picked_up_on_the_next_run(self, tmp_path):
+        paper = Paper(title="Paywalled", url="https://pub.org/1.pdf")
+        pipeline = self._run(tmp_path, [paper], {"https://pub.org/1.pdf": 403})
+        assert pipeline.failed_list is not None
+        (row,) = self._rows(pipeline.failed_list)
+
+        # The user downloads the PDF in a browser and saves it there.
+        Path(row["save_as"]).write_bytes(b"%PDF-1.7\n")
+
+        again = Paper(title="Paywalled", url="https://pub.org/1.pdf")
+        pipeline = self._run(tmp_path, [again], {"https://pub.org/1.pdf": 403})
+        assert again.pdf_status == PdfStatus.CACHED
+        assert pipeline.failed_list is None
+
+    def test_no_list_when_nothing_failed_and_old_list_removed(self, tmp_path):
+        stale = tmp_path / "out" / "papers_failed_pdfs.csv"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("old")
+        paper = Paper(title="Free", url="https://a.org/1.pdf")
+        pipeline = self._run(tmp_path, [paper], {"https://a.org/1.pdf": None})
+        assert pipeline.failed_list is None
+        assert not stale.exists()
+
+    def test_pdfs_without_text_are_not_listed(self, tmp_path):
+        paper = Paper(title="Scanned", url="https://a.org/1.pdf")
+        pipeline = self._run(tmp_path, [paper], {"https://a.org/1.pdf": None}, text="")
+        assert paper.pdf_status == PdfStatus.NO_TEXT
+        assert pipeline.failed_list is None
+
+
+class TestRunSummary:
+    def _write_inputs(self, tmp_path):
+        (tmp_path / "synonyms.jsonl").write_text(
+            '{"word": "LLM", "synonyms": ["large language model"]}\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "categories.yaml").write_text(
+            "categories:\n  Cat:\n    - LLM\n", encoding="utf-8"
+        )
+
+    def test_run_counts_sources_and_duplicates(self, tmp_path):
+        self._write_inputs(tmp_path)
+        cfg = _config(tmp_path, sources=["openalex", "arxiv"], download_pdfs=False)
+        results = {
+            "openalex": [Paper(title="A"), Paper(title="B")],
+            "arxiv": [Paper(title="a "), Paper(title="C")],
+        }
+
+        def fake_adapter(name, **kwargs):
+            adapter = MagicMock()
+            adapter.search.return_value = results[name]
+            return adapter
+
+        with patch("mmore.paper_discovery.pipeline.get_adapter", fake_adapter):
+            pipeline = PaperDiscoveryPipeline(cfg)
+            papers = pipeline.run()
+
+        assert [p.title for p in papers] == ["A", "B", "C"]
+        summary = pipeline.summary()
+        assert summary["openalex"] == "2 papers"
+        assert summary["arxiv"] == "2 papers"
+        assert summary["unique"] == "3 (1 duplicates removed)"
+        assert "full text" not in summary  # PDFs were off
+        assert summary["output"] == cfg.output_file
+        assert Path(cfg.output_file).exists()
+
+    def test_summary_reports_full_text_and_the_list(self, tmp_path):
+        pipeline = PaperDiscoveryPipeline(_config(tmp_path))
+        pipeline.n_unique = 3
+        pipeline.found["openalex"] = 3
+        pipeline.pdf_counts.update(
+            {PdfStatus.DOWNLOADED: 1, PdfStatus.CACHED: 1, PdfStatus.REFUSED: 1}
+        )
+        pipeline.failed_list = tmp_path / "papers_failed_pdfs.csv"
+        summary = pipeline.summary()
+        assert summary["full text"] == "2 papers · 1 without"
+        assert summary["to download"] == str(pipeline.failed_list)

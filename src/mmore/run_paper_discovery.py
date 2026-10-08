@@ -11,19 +11,37 @@ import time
 from mmore.profiler import enable_profiling_from_env, profile_function
 
 from .paper_discovery.config import PaperDiscoveryConfig
-from .paper_discovery.logging_config import logger
 from .paper_discovery.pipeline import PaperDiscoveryPipeline
 from .utils import load_config
+from .ux import quiet_noisy_libs, setup_logging, step_intro, step_summary
+
+PAPER_DISCOVERY_NAME = "Paper Discovery"
+PAPER_DISCOVERY_EMOJI = "📄"
+logger = setup_logging(PAPER_DISCOVERY_NAME, PAPER_DISCOVERY_EMOJI)
 
 
 @profile_function()
 def run_paper_discovery(config_file: str) -> None:
+    quiet_noisy_libs()
     cfg = load_config(config_file, PaperDiscoveryConfig)
+    step_intro(
+        PAPER_DISCOVERY_NAME,
+        PAPER_DISCOVERY_EMOJI,
+        "Find papers for your keywords",
+        [
+            f"sources: {', '.join(cfg.sources)}",
+            f"PDFs: {'on' if cfg.download_pdfs else 'off'}",
+        ],
+    )
     pipeline = PaperDiscoveryPipeline(config=cfg)
-    logger.info("Running Paper Discovery pipeline...")
     start = time.time()
     pipeline.run()
-    logger.info("Completed in %.2fs", time.time() - start)
+    step_summary(
+        PAPER_DISCOVERY_NAME,
+        PAPER_DISCOVERY_EMOJI,
+        time.time() - start,
+        pipeline.summary(),
+    )
 
 
 if __name__ == "__main__":
