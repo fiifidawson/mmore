@@ -1,10 +1,10 @@
 """Explain why a paper's PDF failed to download.
 
-The pipeline reports totals, not reasons. When a run comes back with a
-pile of paywalled or skipped papers, this script takes one URL at a time
-and prints every signal that went into that verdict: status code, final
-URL after redirects, content type, whether the body is a sign-in page,
-and which bucket the pipeline would file it under.
+The pipeline reports one outcome per paper, such as `refused` or
+`login_page`. This script takes one URL at a time and prints every signal
+behind that outcome: status code, final URL after redirects, content
+type, whether the body is a sign-in page, and the outcome the pipeline
+would record.
 
 Fetches each URL twice when a proxy prefix is given, once directly and
 once through the proxy, so you can see whether the proxy changes anything.
@@ -29,7 +29,7 @@ from pathlib import Path
 import requests
 
 from mmore.paper_discovery.pdf import (
-    PAYWALL_STATUSES,
+    _failed,
     _find_pdf_link,
     _looks_like_login_page,
     _looks_like_pdf,
@@ -41,18 +41,17 @@ DEFAULT_PAPERS = Path("examples/paper_discovery/papers.jsonl")
 
 
 def classify(resp: requests.Response) -> str:
-    """What the pipeline would conclude from this response."""
-    if resp.status_code in PAYWALL_STATUSES:
-        return "PAYWALLED (publisher refused us)"
+    """The outcome the pipeline would record for this response."""
     if resp.status_code != 200:
-        return "ERRORED"
+        # The pipeline's own mapping, so the two can't drift apart.
+        return _failed(resp.status_code, resp.url).outcome.value
     if _looks_like_pdf(resp):
-        return "SUCCESS (pdf)"
+        return "downloaded"
     if _looks_like_login_page(resp):
-        return "SKIPPED (sign-in page, we cannot log in)"
+        return "login_page (we cannot log in)"
     if _find_pdf_link(resp.text, base=resp.url):
-        return "SUCCESS (followed a link in the html)"
-    return "SKIPPED (html with no pdf link)"
+        return "follows a PDF link on the page (downloaded if it is a PDF)"
+    return "no_pdf_link"
 
 
 def probe(url: str, prefix: str | None, session: requests.Session) -> None:
@@ -127,12 +126,12 @@ def main() -> None:
     print("\n" + "=" * 72)
     print("""How to read this
 
-  PAYWALLED on a journal you know your institution subscribes to
+  refused on a journal you know your institution subscribes to
       Publishers block automated tools by User-Agent, independently of
       whether you have access. Being on the VPN does not always help, and
       mmore does not spoof the User-Agent to get around it.
 
-  SKIPPED (sign-in page)
+  login_page
       The proxy needs an interactive login. This pipeline cannot complete
       a SAML or Shibboleth sign-in, so there is no headless workaround.
 
@@ -142,8 +141,8 @@ def main() -> None:
       all and grant access by VPN instead, in which case leave
       pdf_proxy_prefix unset.
 
-  SUCCESS direct but the pipeline still failed
-      Likely a transient error. Re-run, the PDF cache keeps what worked.""")
+  downloaded here, but the pipeline still failed
+      Likely a temporary error. Re-run, the PDF cache keeps what worked.""")
 
 
 if __name__ == "__main__":
