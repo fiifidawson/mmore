@@ -44,6 +44,9 @@ class Paper:
     title: str | None = None
     authors: list[str] | None = None
     url: str | None = None
+    doi: str | None = None
+    # Every known link to the paper, best first. `url` is the first one.
+    candidate_urls: list[str] | None = None
     abstract: str | None = None
     year: int | None = None
     extracted_text: str | None = None
@@ -55,12 +58,27 @@ class Paper:
             "title": self.title,
             "authors": self.authors,
             "url": self.url,
+            "doi": self.doi,
+            "candidate_urls": self.candidate_urls,
             "abstract": self.abstract,
             "year": self.year,
             "extracted_text": self.extracted_text,
             "source": self.source,
             "search_category": self.search_category,
         }
+
+    def download_urls(self) -> list[str]:
+        """URLs to try for the PDF, best first."""
+        if self.candidate_urls:
+            return self.candidate_urls
+        return [self.url] if self.url else []
+
+    def cache_key(self) -> str | None:
+        """What the cached PDF is named after: the DOI, else the first URL."""
+        if self.doi:
+            return f"doi:{self.doi}"
+        urls = self.download_urls()
+        return urls[0] if urls else None
 
     def to_multimodal_sample(self, pdf_path: str = "") -> "MultimodalSample":
         """Convert to mmore's document shape so index and rag can read it.
@@ -86,6 +104,8 @@ class Paper:
                 "year": self.year,
                 "source": self.source,
                 "url": self.url,
+                "doi": self.doi,
+                "candidate_urls": self.candidate_urls,
                 "search_category": self.search_category,
                 "abstract": self.abstract,
             }.items()

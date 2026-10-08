@@ -101,12 +101,14 @@ Press **Ctrl+C** at any time — the pipeline catches the interrupt and writes w
 A JSONL file — one `Paper` record per line. Example line:
 
 ```json
-{"title": "A foundation model for humanitarian response", "authors": ["Ada Lovelace", "Alan Turing"], "url": "https://arxiv.org/pdf/2401.00001.pdf", "abstract": "We introduce …", "year": 2024, "extracted_text": "<full PDF text>", "source": "arxiv", "search_category": "Humanitarian AI Search"}
+{"title": "A foundation model for humanitarian response", "authors": ["Ada Lovelace", "Alan Turing"], "url": "https://arxiv.org/pdf/2401.00001.pdf", "doi": "10.1000/xyz123", "candidate_urls": ["https://arxiv.org/pdf/2401.00001.pdf", "https://publisher.example.org/article/xyz123"], "abstract": "We introduce …", "year": 2024, "extracted_text": "<full PDF text>", "source": "arxiv", "search_category": "Humanitarian AI Search"}
 ```
 
 Line-per-record makes the file streamable (read one paper at a time), diff-friendly, and easy to append to. Any JSONL-aware tool (`jq`, `pandas.read_json(lines=True)`, mmore's `MultimodalSample.from_jsonl`) can consume it directly.
 
 Fields are **nullable on purpose** — sources differ in what they return. `null` means "we don't know."
+
+`candidate_urls` lists every known link to the paper, best first. `url` is the first one. When the same paper comes from several sources, their links are merged into one record.
 
 ## ⚙️ Configuration knobs
 
@@ -141,7 +143,7 @@ The default just identifies mmore + the repo URL, which works but doesn't tell a
 
 ## 💾 PDF caching
 
-`pdf_dir` is reused across runs. Each PDF is saved under a hash of its URL. If that file already exists and is a real PDF, the download is skipped. If it isn't a real PDF, it is deleted and downloaded again.
+`pdf_dir` is reused across runs. Each PDF is saved under a hash of the paper's DOI, or of its URL when there is no DOI. If that file already exists and is a real PDF, the download is skipped. If it isn't a real PDF, it is deleted and downloaded again.
 
 A paper only counts as a success if text was extracted from it. The summary line at the end of a run shows the split:
 
@@ -158,6 +160,10 @@ To force a full re-download (e.g. after a publisher updates a paper), set `force
 ## 🔒 Paywalled PDFs
 
 Expect a chunk of your run to come back without full text. Some of that you can fix, some of it you cannot. Read this section before spending time on it.
+
+### Free copies are tried first
+
+Many paywalled papers also have a free, legal copy on arXiv, PubMed Central or a university repository. The pipeline tries those first and falls back to the publisher's copy. If one link fails, it tries the next one in `candidate_urls`.
 
 ### There are two different reasons a PDF fails
 

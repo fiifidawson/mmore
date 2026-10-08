@@ -46,6 +46,7 @@ def download_pdf(
     user_agent: str = "mmore-paper-discovery/1.0",
     timeout: int = 30,
     proxy_prefix: str | None = None,
+    cache_key: str | None = None,
 ) -> DownloadResult:
     """Fetch one PDF, following a landing page if that is what we get.
 
@@ -56,12 +57,14 @@ def download_pdf(
         honestly rather than posing as a browser.
       timeout: Per-request timeout in seconds.
       proxy_prefix: Optional EZproxy host to route through.
+      cache_key: What to name the cached file after. Defaults to `url`.
 
     Returns:
       A `DownloadResult` saying what happened, including whether the
       publisher refused us and whether we hit a sign-in page.
     """
     Path(save_dir).mkdir(parents=True, exist_ok=True)
+    save_path = expected_pdf_path(cache_key or url, save_dir)
     headers = {"User-Agent": user_agent}
     fetch_url = _proxify(url, proxy_prefix)
 
@@ -81,7 +84,7 @@ def download_pdf(
         return DownloadResult(errored=True, status=r.status_code)
 
     if _looks_like_pdf(r):
-        return DownloadResult(path=_save_pdf(r.content, url, save_dir))
+        return DownloadResult(path=_save_pdf(r.content, save_path))
 
     if _looks_like_login_page(r):
         logger.debug("download_pdf got a sign-in page for %s", url)
@@ -108,9 +111,9 @@ def download_pdf(
         return DownloadResult(paywalled=True, status=r2.status_code)
 
     if r2.status_code == 200 and _looks_like_pdf(r2):
-        # Saved under the paper's URL, not the link we followed, so the
+        # Saved under the paper's key, not the link we followed, so the
         # cache check finds it next time.
-        return DownloadResult(path=_save_pdf(r2.content, url, save_dir))
+        return DownloadResult(path=_save_pdf(r2.content, save_path))
     if _looks_like_login_page(r2):
         return DownloadResult(status=r2.status_code, login_page=True)
     return DownloadResult(status=r2.status_code)
@@ -163,19 +166,18 @@ def _looks_like_login_page(response: requests.Response) -> bool:
     return any(marker in body for marker in LOGIN_PAGE_MARKERS)
 
 
-def expected_pdf_path(url: str, save_dir: str) -> Path:
-    """Where a PDF for `url` would be cached. No I/O.
+def expected_pdf_path(key: str, save_dir: str) -> Path:
+    """Where a PDF for `key` (a URL or `doi:...`) would be cached. No I/O.
 
     Shared by the writer and the pipeline's cache check so the two agree.
-    Named after a hash of the URL, so URLs ending in the same word
+    Named after a hash of the key, so URLs ending in the same word
     (`/pdf`, `/fulltext`) don't share a file.
     """
-    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
     return Path(save_dir) / f"{digest}.pdf"
 
 
-def _save_pdf(content: bytes, url: str, save_dir: str) -> str:
-    path = expected_pdf_path(url, save_dir)
+def _save_pdf(content: bytes, path: Path) -> str:
     path.write_bytes(content)
     return str(path)
 

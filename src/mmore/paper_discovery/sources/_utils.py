@@ -37,3 +37,31 @@ def first_year(entry: dict, *keys: str) -> int | None:
         if year is not None:
             return year
     return None
+
+
+DOI_PREFIXES = ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi:")
+
+
+def normalize_doi(value: object) -> str | None:
+    """Bare, lowercase DOI such as `10.1000/xyz`, or None.
+
+    Sources return DOIs as plain strings, `doi:` strings or doi.org URLs.
+    """
+    if not isinstance(value, str):
+        return None
+    doi = value.strip()
+    for prefix in DOI_PREFIXES:
+        if doi.lower().startswith(prefix):
+            doi = doi[len(prefix) :]
+            break
+    doi = doi.strip().lower()
+    return doi if doi.startswith("10.") else None
+
+
+def unique_urls(*urls: str | None) -> list[str]:
+    """Drop empty and repeated URLs, keeping the first-seen order."""
+    out: list[str] = []
+    for url in urls:
+        if url and url not in out:
+            out.append(url)
+    return out

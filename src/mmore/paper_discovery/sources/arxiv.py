@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 import requests
 
 from ..schema import Paper, SourceName
-from ._utils import coerce_year
+from ._utils import coerce_year, normalize_doi, unique_urls
 from .base import SourceAdapter
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,10 @@ API_URL = "http://export.arxiv.org/api/query"
 RATE_LIMIT_SECONDS = 3.0  # arXiv terms of use. Do not lower.
 BACKOFF_SECONDS = 30.0  # Cooldown after a 429. arXiv recovers quickly given room.
 REQUEST_TIMEOUT = 60  # arXiv cold queries often take 30-45s.
-NS = {"atom": "http://www.w3.org/2005/Atom"}
+NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "arxiv": "http://arxiv.org/schemas/atom",
+}
 
 # arXiv's query language degrades quickly past a small number of quoted
 # phrases, and the 3-second rate limit makes every extra query expensive.
@@ -165,12 +168,16 @@ def _parse_atom(xml_text: str, category_title: str) -> list[Paper]:
                 pdf_url = link.attrib.get("href")
                 break
         landing = _text(entry, "atom:id")
+        urls = unique_urls(pdf_url, landing)
 
         out.append(
             Paper(
                 title=(title or "").strip() or None,
                 authors=authors or None,
-                url=pdf_url or landing,
+                url=urls[0] if urls else None,
+                # Only set once the paper is published elsewhere.
+                doi=normalize_doi(_text(entry, "arxiv:doi")),
+                candidate_urls=urls or None,
                 abstract=(summary or "").strip() or None,
                 year=year,
                 source=SourceName.ARXIV,
