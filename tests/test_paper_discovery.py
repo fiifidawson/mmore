@@ -18,12 +18,18 @@ from mmore.paper_discovery.pdf import (
     download_pdf,
     expected_pdf_path,
 )
-from mmore.paper_discovery.pipeline import PaperDiscoveryPipeline
+from mmore.paper_discovery.pipeline import PaperDiscoveryPipeline, _dedupe
 from mmore.paper_discovery.schema import Paper, SourceName, SynonymEntry
-from mmore.paper_discovery.sources._utils import coerce_year, first_year
+from mmore.paper_discovery.sources._utils import (
+    coerce_year,
+    first_year,
+    normalize_doi,
+    unique_urls,
+)
 from mmore.paper_discovery.sources.arxiv import (
     _build_simplified_queries,
     _extract_terms,
+    _parse_atom,
 )
 from mmore.paper_discovery.sources.europepmc import EuropePmcAdapter, _parse_authors
 from mmore.paper_discovery.sources.openalex import OpenAlexAdapter, _rebuild_abstract
@@ -299,8 +305,8 @@ class TestEnrichWithPdfText:
         return PaperDiscoveryPipeline(cfg)
 
     def _download_ok(self, tmp_path):
-        def fake(url, save_dir, **kwargs):
-            path = expected_pdf_path(url, save_dir)
+        def fake(url, save_dir, cache_key=None, **kwargs):
+            path = expected_pdf_path(cache_key or url, save_dir)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"%PDF-1.7\n")
             return DownloadResult(path=str(path))
@@ -359,6 +365,88 @@ class TestEnrichWithPdfText:
             pipeline._enrich_with_pdf_text([paper])
         download.assert_not_called()
         assert "1/1 succeeded (1 cached, 0 fresh)" in caplog.text
+
+
+class TestTryEveryUrl:
+    def _pipeline(self, tmp_path):
+        cfg = PaperDiscoveryConfig(
+            synonyms_path="unused",
+            categories_path="unused",
+            output_file=str(tmp_path / "out.jsonl"),
+            pdf_dir=str(tmp_path / "pdfs"),
+        )
+        return PaperDiscoveryPipeline(cfg)
+
+    def test_falls_back_to_the_next_url(self, tmp_path, caplog):
+        pipeline = self._pipeline(tmp_path)
+        paper = Paper(
+            title="T",
+            doi="10.1000/xyz",
+            candidate_urls=[
+                "https://example.org/oa.pdf",
+                "https://publisher.example.org/paper.pdf",
+            ],
+        )
+        cached = expected_pdf_path("doi:10.1000/xyz", pipeline.config.pdf_dir)
+
+        def fake(url, save_dir, cache_key=None, **kwargs):
+            if url == "https://example.org/oa.pdf":
+                return DownloadResult(errored=True)
+            path = expected_pdf_path(cache_key or url, save_dir)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"%PDF-1.7\n")
+            return DownloadResult(path=str(path))
+
+        download = MagicMock(side_effect=fake)
+        with (
+            patch("mmore.paper_discovery.pipeline.download_pdf", download),
+            patch("mmore.paper_discovery.pipeline.extract_text", return_value="text"),
+            caplog.at_level("INFO"),
+        ):
+            pipeline._enrich_with_pdf_text([paper])
+        assert download.call_count == 2
+        assert cached.exists()  # named after the DOI, not the URL
+        assert "1/1 succeeded" in caplog.text
+
+
+class TestDownloadPdfCacheKey:
+    def test_pdf_found_on_landing_page_is_saved_under_the_key(self, tmp_path):
+        landing = MagicMock(status_code=200, url="https://example.org/article")
+        landing.content = b"<html></html>"
+        landing.text = '<meta name="citation_pdf_url" content="/main.pdf">'
+        landing.headers = {"Content-Type": "text/html"}
+        pdf = MagicMock(status_code=200, url="https://example.org/main.pdf")
+        pdf.content = b"%PDF-1.7\n"
+        pdf.headers = {"Content-Type": "application/pdf"}
+
+        with patch(
+            "mmore.paper_discovery.pdf.requests.get", side_effect=[landing, pdf]
+        ):
+            result = download_pdf(
+                "https://example.org/article", str(tmp_path), cache_key="doi:10.1/a"
+            )
+        assert result.path == str(expected_pdf_path("doi:10.1/a", str(tmp_path)))
+
+
+class TestDedupe:
+    def test_merges_urls_of_the_same_doi(self):
+        a = Paper(title="A", doi="10.1/a", candidate_urls=["https://pub.org/a"])
+        b = Paper(title="A (preprint)", doi="10.1/a", url="https://arxiv.org/a.pdf")
+        out = _dedupe([a, b])
+        assert out == [a]
+        assert a.candidate_urls == ["https://pub.org/a", "https://arxiv.org/a.pdf"]
+
+    def test_merges_by_title_and_fills_the_doi(self):
+        a = Paper(title="Same Title", url="https://arxiv.org/a.pdf")
+        b = Paper(title="same title ", doi="10.1/a", url="https://pub.org/a")
+        out = _dedupe([a, b])
+        assert out == [a]
+        assert a.doi == "10.1/a"
+        assert a.download_urls() == ["https://arxiv.org/a.pdf", "https://pub.org/a"]
+
+    def test_keeps_different_papers(self):
+        out = _dedupe([Paper(title="A"), Paper(title="B"), Paper(title=None)])
+        assert [p.title for p in out] == ["A", "B"]
 
 
 # ---------------------------------------------------------------------------
@@ -558,3 +646,118 @@ class TestPaperToMultimodalSample:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Open-access URLs and DOIs
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeDoi:
+    def test_handles_the_shapes_sources_return(self):
+        assert normalize_doi("https://doi.org/10.1000/XYZ") == "10.1000/xyz"
+        assert normalize_doi("doi:10.1000/xyz") == "10.1000/xyz"
+        assert normalize_doi(" 10.1000/xyz ") == "10.1000/xyz"
+
+    def test_rejects_non_dois(self):
+        assert normalize_doi(None) is None
+        assert normalize_doi("") is None
+        assert normalize_doi("not a doi") is None
+
+
+def test_unique_urls_keeps_order_and_drops_repeats():
+    assert unique_urls("a", None, "b", "a", "") == ["a", "b"]
+
+
+class TestPaperUrls:
+    def test_cache_key_prefers_the_doi(self):
+        p = Paper(doi="10.1/a", url="https://example.org/a.pdf")
+        assert p.cache_key() == "doi:10.1/a"
+
+    def test_cache_key_falls_back_to_the_url(self):
+        url = "https://example.org/a.pdf"
+        assert Paper(url=url).cache_key() == url
+        assert Paper().cache_key() is None
+
+    def test_download_urls_falls_back_to_url(self):
+        assert Paper(url="u").download_urls() == ["u"]
+        assert Paper(url="u", candidate_urls=["c", "u"]).download_urls() == ["c", "u"]
+
+    def test_to_dict_includes_doi_and_candidates(self):
+        d = Paper(doi="10.1/a", candidate_urls=["u"]).to_dict()
+        assert d["doi"] == "10.1/a"
+        assert d["candidate_urls"] == ["u"]
+
+
+class TestOpenAlexOpenAccess:
+    def test_open_access_copy_comes_first(self):
+        work = {
+            "title": "A Paper",
+            "doi": "https://doi.org/10.1/A",
+            "best_oa_location": {"pdf_url": "https://arxiv.org/pdf/1"},
+            "open_access": {"oa_url": "https://europepmc.org/1"},
+            "primary_location": {
+                "pdf_url": "https://publisher.org/1.pdf",
+                "landing_page_url": "https://publisher.org/1",
+            },
+        }
+        p = OpenAlexAdapter()._to_paper(work, "Cat")
+        assert p.url == "https://arxiv.org/pdf/1"
+        assert p.doi == "10.1/a"
+        assert p.candidate_urls == [
+            "https://arxiv.org/pdf/1",
+            "https://europepmc.org/1",
+            "https://publisher.org/1.pdf",
+            "https://publisher.org/1",
+        ]
+
+    def test_falls_back_to_primary_location(self):
+        work = {"primary_location": {"pdf_url": "https://publisher.org/1.pdf"}}
+        p = OpenAlexAdapter()._to_paper(work, "Cat")
+        assert p.url == "https://publisher.org/1.pdf"
+        assert p.doi is None
+
+
+class TestEuropePmcOpenAccess:
+    def test_free_pdf_comes_before_subscription_pdf(self):
+        links = [
+            {
+                "url": "https://pub.org/1.pdf",
+                "documentStyle": "pdf",
+                "availabilityCode": "S",
+            },
+            {
+                "url": "https://pub.org/1",
+                "documentStyle": "html",
+                "availabilityCode": "OA",
+            },
+            {
+                "url": "https://pmc.org/1.pdf",
+                "documentStyle": "pdf",
+                "availabilityCode": "OA",
+            },
+        ]
+        entry = {"doi": "10.1/A", "fullTextUrlList": {"fullTextUrl": links}}
+        p = EuropePmcAdapter()._to_paper(entry, "Cat")
+        assert p.doi == "10.1/a"
+        assert p.candidate_urls == [
+            "https://pmc.org/1.pdf",
+            "https://pub.org/1.pdf",
+            "https://pub.org/1",
+        ]
+
+
+class TestArxivDoi:
+    def test_reads_the_doi_when_present(self):
+        xml = """<feed xmlns="http://www.w3.org/2005/Atom"
+                       xmlns:arxiv="http://arxiv.org/schemas/atom">
+          <entry>
+            <id>http://arxiv.org/abs/1</id>
+            <title>A Paper</title>
+            <link type="application/pdf" href="http://arxiv.org/pdf/1"/>
+            <arxiv:doi>10.1/A</arxiv:doi>
+          </entry>
+        </feed>"""
+        (p,) = _parse_atom(xml, "Cat")
+        assert p.doi == "10.1/a"
+        assert p.candidate_urls == ["http://arxiv.org/pdf/1", "http://arxiv.org/abs/1"]

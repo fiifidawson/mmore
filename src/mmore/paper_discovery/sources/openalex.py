@@ -4,7 +4,7 @@ import time
 import requests
 
 from ..schema import Paper, SourceName
-from ._utils import coerce_year
+from ._utils import coerce_year, normalize_doi, unique_urls
 from .base import SourceAdapter
 
 logger = logging.getLogger(__name__)
@@ -64,14 +64,26 @@ class OpenAlexAdapter(SourceAdapter):
             for a in work.get("authorships", [])
             if a.get("author", {}).get("display_name")
         ]
-        loc = work.get("primary_location") or {}
-        pdf_url = loc.get("pdf_url")
-        landing = loc.get("landing_page_url") or work.get("id")
+        # Free legal copies (arXiv, PubMed Central, repositories) come first.
+        # The primary location is usually the publisher's paywalled page.
+        best_oa = work.get("best_oa_location") or {}
+        primary = work.get("primary_location") or {}
+        urls = unique_urls(
+            best_oa.get("pdf_url"),
+            (work.get("open_access") or {}).get("oa_url"),
+            primary.get("pdf_url"),
+            primary.get("landing_page_url"),
+        )
+        # The OpenAlex record page never has the PDF. Keep it only as the
+        # paper's link when there is nothing else.
+        urls = urls or unique_urls(work.get("id"))
 
         return Paper(
             title=work.get("title"),
             authors=authors or None,
-            url=pdf_url or landing,
+            url=urls[0] if urls else None,
+            doi=normalize_doi(work.get("doi")),
+            candidate_urls=urls or None,
             abstract=_rebuild_abstract(work.get("abstract_inverted_index")),
             year=coerce_year(work.get("publication_year")),
             source=SourceName.OPENALEX,

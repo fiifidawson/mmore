@@ -4,13 +4,17 @@ import time
 import requests
 
 from ..schema import Paper, SourceName
-from ._utils import first_year
+from ._utils import first_year, normalize_doi, unique_urls
 from .base import SourceAdapter
 
 logger = logging.getLogger(__name__)
 
 API_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 RATE_LIMIT_SECONDS = 1.0
+
+# Europe PMC availability codes for a full-text link: open access and free.
+# Other codes (subscription, registration) go after these.
+FREE_AVAILABILITY = {"OA", "F"}
 
 
 class EuropePmcAdapter(SourceAdapter):
@@ -61,18 +65,25 @@ class EuropePmcAdapter(SourceAdapter):
         return papers
 
     def _to_paper(self, entry: dict, category_title: str) -> Paper:
-        urls = entry.get("fullTextUrlList", {}).get("fullTextUrl", [])
-        pdf_url = next(
-            (u.get("url") for u in urls if u.get("documentStyle", "").lower() == "pdf"),
-            None,
+        links = entry.get("fullTextUrlList", {}).get("fullTextUrl", [])
+        # Free PDFs first, then other PDFs, then free pages, then the rest.
+        # `sorted` is stable, so the API's order is kept within each group.
+        ranked = sorted(
+            links,
+            key=lambda u: (
+                u.get("documentStyle", "").lower() != "pdf",
+                u.get("availabilityCode") not in FREE_AVAILABILITY,
+            ),
         )
-        landing = next((u.get("url") for u in urls), None)
+        urls = unique_urls(*(u.get("url") for u in ranked))
         year = first_year(entry, "pubYear", "firstPublicationDate")
 
         return Paper(
             title=entry.get("title"),
             authors=_parse_authors(entry),
-            url=pdf_url or landing,
+            url=urls[0] if urls else None,
+            doi=normalize_doi(entry.get("doi")),
+            candidate_urls=urls or None,
             abstract=entry.get("abstractText"),
             year=year,
             source=SourceName.EUROPEPMC,

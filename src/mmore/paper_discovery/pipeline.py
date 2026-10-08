@@ -10,7 +10,13 @@ from dacite import from_dict
 from ..ux import progress
 from .boolean import build_boolean_queries, load_synonyms
 from .config import CategoriesFile, PaperDiscoveryConfig
-from .pdf import download_pdf, expected_pdf_path, extract_text, is_pdf_file
+from .pdf import (
+    DownloadResult,
+    download_pdf,
+    expected_pdf_path,
+    extract_text,
+    is_pdf_file,
+)
 from .schema import CategoryQuery, Paper
 from .sources import get_adapter
 
@@ -92,14 +98,15 @@ class PaperDiscoveryPipeline:
 
         with progress(total=len(papers), desc="PDFs", unit="paper") as bar:
             for paper in papers:
-                if not paper.url:
+                key = paper.cache_key()
+                if key is None:
                     skipped += 1
                     bar.update()
                     continue
 
                 pdf_path: str | None = None
                 from_cache = False
-                cached_path = expected_pdf_path(paper.url, cfg.pdf_dir)
+                cached_path = expected_pdf_path(key, cfg.pdf_dir)
                 if not cfg.force_redownload and cached_path.exists():
                     if is_pdf_file(cached_path):
                         # Cache hit - skip the HTTP fetch entirely.
@@ -109,12 +116,7 @@ class PaperDiscoveryPipeline:
                         cached_path.unlink(missing_ok=True)
 
                 if pdf_path is None:
-                    result = download_pdf(
-                        paper.url,
-                        cfg.pdf_dir,
-                        user_agent=cfg.user_agent,
-                        proxy_prefix=cfg.pdf_proxy_prefix,
-                    )
+                    result = self._download_first(paper, key)
                     pdf_path = result.path
                     if result.paywalled:
                         paywalled += 1
@@ -183,6 +185,25 @@ class PaperDiscoveryPipeline:
                 paywalled,
             )
 
+    def _download_first(self, paper: Paper, key: str) -> DownloadResult:
+        """Try each of the paper's URLs until one gives a PDF.
+
+        If none does, returns the last attempt's result.
+        """
+        cfg = self.config
+        result = DownloadResult()
+        for url in paper.download_urls():
+            result = download_pdf(
+                url,
+                cfg.pdf_dir,
+                user_agent=cfg.user_agent,
+                proxy_prefix=cfg.pdf_proxy_prefix,
+                cache_key=key,
+            )
+            if result.path:
+                break
+        return result
+
     def _write_output(self, papers: list[Paper]) -> None:
         cfg = self.config
         out_path = Path(cfg.output_file)
@@ -206,14 +227,15 @@ class PaperDiscoveryPipeline:
         if out_path.exists():
             out_path.unlink()
 
-        samples = [
-            p.to_multimodal_sample(
-                pdf_path=str(expected_pdf_path(p.url, self.config.pdf_dir))
-                if p.url and p.extracted_text
-                else "",
+        samples = []
+        for p in papers:
+            key = p.cache_key()
+            pdf_path = (
+                str(expected_pdf_path(key, self.config.pdf_dir))
+                if key and p.extracted_text
+                else ""
             )
-            for p in papers
-        ]
+            samples.append(p.to_multimodal_sample(pdf_path=pdf_path))
         MultimodalSample.to_jsonl(str(out_path), samples)
         logger.info(
             "Wrote %d MultimodalSample records to %s (mmore-native shape)",
@@ -230,12 +252,32 @@ def _load_categories(path: str) -> dict[str, list[str]]:
 
 
 def _dedupe(papers: list[Paper]) -> list[Paper]:
-    seen = set()
+    """Keep one paper per DOI or title, merging what the copies know.
+
+    The first copy is kept. Later copies add their URLs as fallbacks and
+    fill in a missing DOI, so a paywalled publisher link can fall back to
+    the arXiv PDF of the same paper.
+    """
+    by_doi: dict[str, Paper] = {}
+    by_title: dict[str, Paper] = {}
     out: list[Paper] = []
     for p in papers:
-        key = (p.title or "").strip().lower()
-        if not key or key in seen:
+        title = (p.title or "").strip().lower()
+        if not title and not p.doi:
             continue
-        seen.add(key)
-        out.append(p)
+        kept = by_doi.get(p.doi) if p.doi else None
+        if kept is None and title:
+            kept = by_title.get(title)
+        if kept is None:
+            kept = p
+            out.append(p)
+        else:
+            urls = [*kept.download_urls(), *p.download_urls()]
+            kept.candidate_urls = list(dict.fromkeys(urls)) or None
+            kept.url = kept.url or p.url
+            kept.doi = kept.doi or p.doi
+        if kept.doi:
+            by_doi.setdefault(kept.doi, kept)
+        if title:
+            by_title.setdefault(title, kept)
     return out
