@@ -13,7 +13,7 @@ from mmore.profiler import enable_profiling_from_env, profile_function
 from .paper_discovery.config import PaperDiscoveryConfig
 from .paper_discovery.pipeline import PaperDiscoveryPipeline
 from .utils import load_config
-from .ux import quiet_noisy_libs, setup_logging, step_intro, step_summary
+from .ux import card, quiet_noisy_libs, setup_logging, step_intro, step_summary
 
 PAPER_DISCOVERY_NAME = "Paper Discovery"
 PAPER_DISCOVERY_EMOJI = "📄"
@@ -42,6 +42,9 @@ def run_paper_discovery(config_file: str) -> None:
         time.time() - start,
         pipeline.summary(),
     )
+    steps = pipeline.next_steps()
+    if steps:
+        card("Next steps", steps)
 
 
 if __name__ == "__main__":
