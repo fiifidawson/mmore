@@ -91,7 +91,7 @@ python3 -m mmore paper-discovery --config-file examples/paper_discovery/config.y
 Progress is shown live with a tqdm bar while PDFs are being downloaded:
 
 ```
-PDFs:  42%|████▏     | 52/124 [01:15<01:43, 1.45s/paper, ok=42, cache=0, paywall=8, err=2]
+PDFs:  42%|████▏     | 52/124 [01:15<01:43, 1.45s/paper, ok=42, cache=0, refused=8, failed=2]
 ```
 
 Press **Ctrl+C** at any time — the pipeline catches the interrupt and writes whatever it has so far to `output_file` before exiting.
@@ -125,6 +125,7 @@ Fields are **nullable on purpose** — sources differ in what they return. `null
 | `pdf_extractor` | `"fast"` | Which mmore PDF processor to use. `"fast"` = PyMuPDF-backed, no models loaded. `"full"` = marker + surya for better parsing (slow, downloads models) |
 | `multimodal_output_file` | `null` | If set, also write a JSONL of `MultimodalSample` records that mmore's post-process / index / RAG pipelines can consume directly (see [Feeding results into mmore's index / RAG](#-feeding-results-into-mmores-index--rag)) |
 | `pdf_proxy_prefix` | `null` | EZproxy host, only if your institution runs one. Leave unset for VPN-based access (see *Paywalled PDFs* below) |
+| `pdf_timeout` | `30` | Seconds to wait for each PDF request. Raise it for slow publishers or proxies |
 | `user_agent` | `mmore-paper-discovery/1.0 …` | HTTP `User-Agent` header sent on every outbound request — see below |
 | `arxiv_category_map` | `null` | Maps a substring of your category title to an arXiv code (e.g. `Foundational` → `cs.LG`) — adds `cat:<code>` to the arXiv query |
 | `arxiv_enable_pair_query` | `true` | Runs one extra arXiv search per category that requires the top two terms together (better precision). Turn off if you'd rather save a few seconds per category |
@@ -148,8 +149,27 @@ The default just identifies mmore + the repo URL, which works but doesn't tell a
 A paper only counts as a success if text was extracted from it. The summary line at the end of a run shows the split:
 
 ```
-PDF download: 108/124 succeeded (45 cached, 63 fresh), 16 paywalled, 0 errors, 0 skipped, 0 with no text
+PDF download: 108/124 succeeded (45 cached, 63 fresh). Not downloaded: 12 refused, 2 not found, 1 timeout, 1 no text
 ```
+
+Only the outcomes that happened are listed:
+
+| Outcome | Meaning |
+|---|---|
+| `refused` | The publisher said no (401/402/403). See *Paywalled PDFs* below |
+| `rate limited` | Still told to slow down (429) after retries. Rerun later |
+| `login page` | A sign-in page came back instead of the PDF |
+| `not found` | The link is dead (404/410) |
+| `no pdf link` | A web page with no PDF link on it |
+| `not pdf` | The PDF link returned something else |
+| `timeout` | No answer in time, after retries. Raise `pdf_timeout` |
+| `server error` | The publisher's server failed (5xx), after retries |
+| `http error` | Any other unexpected status |
+| `network error` | DNS, SSL or connection failure |
+| `no url` | The source gave no link |
+| `no text` | A real PDF, but no text came out. Try `pdf_extractor: full` |
+
+Timeouts, rate limits and server errors are retried twice, waiting longer each time. A `Retry-After` header is honoured.
 
 > Caches from versions before this naming change aren't reused. Those PDFs are downloaded again.
 
@@ -167,7 +187,7 @@ Many paywalled papers also have a free, legal copy on arXiv, PubMed Central or a
 
 ### There are two different reasons a PDF fails
 
-They look the same in the summary line but have completely different fixes.
+Both show up as `refused` in the summary line, but they have completely different fixes.
 
 **1. You don't have access.** Your institution has no subscription to that journal. Nothing in this pipeline can fix that. Request the paper through your library instead.
 

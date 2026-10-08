@@ -19,6 +19,25 @@ class SourceName(str, Enum):
     GOOGLE_SCHOLAR = "google_scholar"
 
 
+class PdfStatus(str, Enum):
+    """What happened when we tried to get a paper's PDF."""
+
+    DOWNLOADED = "downloaded"
+    CACHED = "cached"  # reused from `pdf_dir`
+    NO_TEXT = "no_text"  # a real PDF, but no text came out of it
+    NO_URL = "no_url"  # the source gave no link
+    REFUSED = "refused"  # 401/402/403: no subscription, or bots blocked
+    RATE_LIMITED = "rate_limited"  # 429, still refused after retries
+    LOGIN_PAGE = "login_page"  # a sign-in page instead of the PDF
+    NOT_FOUND = "not_found"  # 404/410
+    NO_PDF_LINK = "no_pdf_link"  # a web page with no PDF link on it
+    NOT_PDF = "not_pdf"  # the PDF link returned something else
+    TIMEOUT = "timeout"  # no answer in `pdf_timeout`, after retries
+    SERVER_ERROR = "server_error"  # 5xx, after retries
+    HTTP_ERROR = "http_error"  # any other unexpected status
+    NETWORK_ERROR = "network_error"  # DNS, SSL or connection failure
+
+
 @dataclass
 class CategoryQuery:
     """A boolean query for one category. Stage 1 builds these, stage 2 runs them."""

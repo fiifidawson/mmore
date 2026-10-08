@@ -81,6 +81,10 @@ class PaperDiscoveryConfig:
     EZproxy, and use the host your library publishes. Leave unset if access
     comes from VPN and IP recognition, since the direct URL already works."""
 
+    pdf_timeout: int = 30
+    """Seconds to wait for each PDF request. Raise it for slow publishers
+    or proxies."""
+
     # Extra output.
     multimodal_output_file: str | None = None
     """If set, also write the results as `MultimodalSample` JSONL, which

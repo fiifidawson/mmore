@@ -2,6 +2,7 @@
 
 import json
 import logging
+from collections import Counter
 from pathlib import Path
 
 import yaml
@@ -17,7 +18,7 @@ from .pdf import (
     extract_text,
     is_pdf_file,
 )
-from .schema import CategoryQuery, Paper
+from .schema import CategoryQuery, Paper, PdfStatus
 from .sources import get_adapter
 
 logger = logging.getLogger(__name__)
@@ -92,117 +93,73 @@ class PaperDiscoveryPipeline:
         return out
 
     def _enrich_with_pdf_text(self, papers: list[Paper]) -> None:
-        cfg = self.config
-        cached = succeeded = paywalled = errored = skipped = no_text = 0
-        login_pages = 0
-
+        counts: Counter[PdfStatus] = Counter()
         with progress(total=len(papers), desc="PDFs", unit="paper") as bar:
             for paper in papers:
-                key = paper.cache_key()
-                if key is None:
-                    skipped += 1
-                    bar.update()
-                    continue
-
-                pdf_path: str | None = None
-                from_cache = False
-                cached_path = expected_pdf_path(key, cfg.pdf_dir)
-                if not cfg.force_redownload and cached_path.exists():
-                    if is_pdf_file(cached_path):
-                        # Cache hit - skip the HTTP fetch entirely.
-                        pdf_path, from_cache = str(cached_path), True
-                    else:
-                        logger.debug("Removing non-PDF cache file %s", cached_path)
-                        cached_path.unlink(missing_ok=True)
-
-                if pdf_path is None:
-                    result = self._download_first(paper, key)
-                    pdf_path = result.path
-                    if result.paywalled:
-                        paywalled += 1
-                    elif result.errored:
-                        errored += 1
-                    elif not pdf_path:
-                        if result.login_page:
-                            login_pages += 1
-                        skipped += 1
-
-                if pdf_path:
-                    paper.extracted_text = (
-                        extract_text(pdf_path, mode=cfg.pdf_extractor) or None
-                    )
-                    # Only a PDF that gave us text counts as a success.
-                    if paper.extracted_text:
-                        succeeded += 1
-                        if from_cache:
-                            cached += 1
-                    else:
-                        no_text += 1
-
+                counts[self._fetch_text(paper)] += 1
+                failed = sum(n for s, n in counts.items() if s not in SUCCESS)
                 bar.set_postfix_str(
-                    f"ok={succeeded} cache={cached} paywall={paywalled} err={errored}"
+                    f"ok={counts[PdfStatus.DOWNLOADED] + counts[PdfStatus.CACHED]} "
+                    f"cache={counts[PdfStatus.CACHED]} "
+                    f"refused={counts[PdfStatus.REFUSED]} failed={failed}"
                 )
                 bar.update()
+        _log_pdf_summary(counts)
 
-        total = succeeded + paywalled + errored + skipped + no_text
-        fresh = succeeded - cached
-        logger.info(
-            "PDF download: %d/%d succeeded (%d cached, %d fresh), "
-            "%d paywalled, %d errors, %d skipped, %d with no text",
-            succeeded,
-            total,
-            cached,
-            fresh,
-            paywalled,
-            errored,
-            skipped,
-            no_text,
-        )
-        if no_text:
-            logger.warning(
-                "%d PDFs gave no text. They may be scanned images. "
-                "Try `pdf_extractor: full`.",
-                no_text,
-            )
-        if login_pages:
-            logger.warning(
-                "%d downloads returned a sign-in page instead of a PDF. "
-                "This pipeline cannot log in for you. If you set "
-                "`pdf_proxy_prefix`, check the host is your institution's "
-                "real EZproxy and that you can reach it. If your institution "
-                "grants access by VPN instead, unset `pdf_proxy_prefix` and "
-                "connect to the VPN.",
-                login_pages,
-            )
+    def _fetch_text(self, paper: Paper) -> PdfStatus:
+        """Get the paper's PDF from the cache or the web, and extract its text."""
+        cfg = self.config
+        key = paper.cache_key()
+        if key is None:
+            return PdfStatus.NO_URL
 
-        if paywalled:
-            logger.info(
-                "%d PDFs were refused by the publisher (401/402/403/429). "
-                "Publishers commonly block automated tools by User-Agent "
-                "even when your institution has a subscription, so being on "
-                "the VPN does not always help. Set `download_pdfs: false` to "
-                "skip PDFs and keep metadata and abstracts only.",
-                paywalled,
-            )
+        pdf_path: str | None = None
+        status = PdfStatus.DOWNLOADED
+        cached_path = expected_pdf_path(key, cfg.pdf_dir)
+        if not cfg.force_redownload and cached_path.exists():
+            if is_pdf_file(cached_path):
+                # Cache hit - skip the HTTP fetch entirely.
+                pdf_path, status = str(cached_path), PdfStatus.CACHED
+            else:
+                logger.debug("Removing non-PDF cache file %s", cached_path)
+                cached_path.unlink(missing_ok=True)
+
+        if pdf_path is None:
+            result = self._download_first(paper, key)
+            if not result.path:
+                return result.outcome
+            pdf_path = result.path
+
+        paper.extracted_text = extract_text(pdf_path, mode=cfg.pdf_extractor) or None
+        # Only a PDF that gave us text counts as a success.
+        return status if paper.extracted_text else PdfStatus.NO_TEXT
 
     def _download_first(self, paper: Paper, key: str) -> DownloadResult:
         """Try each of the paper's URLs until one gives a PDF.
 
-        If none does, returns the last attempt's result.
+        If none does, reports the failure the user can act on, if any.
         """
         cfg = self.config
-        result = DownloadResult()
+        results: list[DownloadResult] = []
         for url in paper.download_urls():
             result = download_pdf(
                 url,
                 cfg.pdf_dir,
                 user_agent=cfg.user_agent,
+                timeout=cfg.pdf_timeout,
                 proxy_prefix=cfg.pdf_proxy_prefix,
                 cache_key=key,
             )
             if result.path:
-                break
-        return result
+                return result
+            results.append(result)
+        if not results:  # a DOI but no link
+            return DownloadResult(PdfStatus.NO_URL)
+        for outcome in TELLING_FAILURES:
+            for result in results:
+                if result.outcome == outcome:
+                    return result
+        return results[-1]
 
     def _write_output(self, papers: list[Paper]) -> None:
         cfg = self.config
@@ -241,6 +198,67 @@ class PaperDiscoveryPipeline:
             "Wrote %d MultimodalSample records to %s (mmore-native shape)",
             len(samples),
             out_path,
+        )
+
+
+SUCCESS = {PdfStatus.DOWNLOADED, PdfStatus.CACHED}
+
+# When every link fails, report these first: they tell the user what to do.
+# A landing page with no PDF link says less than the publisher refusing us.
+TELLING_FAILURES = (PdfStatus.LOGIN_PAGE, PdfStatus.REFUSED, PdfStatus.RATE_LIMITED)
+
+
+def _log_pdf_summary(counts: "Counter[PdfStatus]") -> None:
+    """One summary line, then a hint for each failure the user can act on."""
+    succeeded = counts[PdfStatus.DOWNLOADED] + counts[PdfStatus.CACHED]
+    failures = ", ".join(
+        f"{counts[s]} {s.value.replace('_', ' ')}"
+        for s in PdfStatus
+        if s not in SUCCESS and counts[s]
+    )
+    logger.info(
+        "PDF download: %d/%d succeeded (%d cached, %d fresh)%s",
+        succeeded,
+        sum(counts.values()),
+        counts[PdfStatus.CACHED],
+        counts[PdfStatus.DOWNLOADED],
+        f". Not downloaded: {failures}" if failures else "",
+    )
+
+    if counts[PdfStatus.NO_TEXT]:
+        logger.warning(
+            "%d PDFs gave no text. They may be scanned images. "
+            "Try `pdf_extractor: full`.",
+            counts[PdfStatus.NO_TEXT],
+        )
+    if counts[PdfStatus.LOGIN_PAGE]:
+        logger.warning(
+            "%d downloads returned a sign-in page instead of a PDF. "
+            "This pipeline cannot log in for you. If you set "
+            "`pdf_proxy_prefix`, check the host is your institution's "
+            "real EZproxy and that you can reach it. If your institution "
+            "grants access by VPN instead, unset `pdf_proxy_prefix` and "
+            "connect to the VPN.",
+            counts[PdfStatus.LOGIN_PAGE],
+        )
+    if counts[PdfStatus.REFUSED]:
+        logger.info(
+            "%d PDFs were refused by the publisher (401/402/403). Either "
+            "there is no subscription, or the publisher blocks automated "
+            "tools. Being on the VPN does not always help. Set "
+            "`download_pdfs: false` to keep metadata and abstracts only.",
+            counts[PdfStatus.REFUSED],
+        )
+    if counts[PdfStatus.RATE_LIMITED]:
+        logger.info(
+            "%d PDFs were still rate-limited (429) after retries. Rerun "
+            "later. PDFs already downloaded are reused.",
+            counts[PdfStatus.RATE_LIMITED],
+        )
+    if counts[PdfStatus.TIMEOUT]:
+        logger.info(
+            "%d PDFs timed out. Raise `pdf_timeout` for slow publishers or proxies.",
+            counts[PdfStatus.TIMEOUT],
         )
 
 
