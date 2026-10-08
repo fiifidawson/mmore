@@ -2,15 +2,21 @@
 
 ## Overview
 
-The **Paper Discovery** module helps you build a targeted collection of academic papers on a topic you care about. You describe the topic once — as a list of keywords with synonyms — and the module searches several open academic repositories (OpenAlex, Europe PMC, arXiv, optionally Google Scholar) on your behalf, downloads whatever PDFs it can, and writes a single JSON file with the metadata and extracted text.
+The **Paper Discovery** module helps you build a targeted collection of academic papers on a topic you care about. You describe the topic once — as a list of keywords with synonyms — and the module searches several open academic repositories (OpenAlex, Europe PMC, arXiv, optionally Google Scholar) on your behalf, downloads whatever PDFs it can, and writes a JSONL file with the metadata and extracted text.
 
-The output is a plain `Paper[]` JSON list. What you do with it next is up to you — feed it into an indexer, hand it to a screening tool, or just read the abstracts. This page describes the standalone `paper_discovery` module. It is independent of the `rag` and `index` pipelines.
+The output has one paper per line, each with a status saying what happened to its PDF. What you do with it next is up to you — feed it into an indexer, hand it to a screening tool, or just read the abstracts. This page describes the standalone `paper_discovery` module. It is independent of the `rag` and `index` pipelines.
 
 ## Installation
 
 ```bash
 uv pip install "mmore[paper_discovery]"
 ```
+
+> The `paper_discovery` extra isn't in the `2.0.0` release on PyPI. Until the next release, install from GitHub:
+>
+> ```bash
+> uv pip install "mmore[paper_discovery] @ git+https://github.com/EPFLiGHT/mmore.git@main"
+> ```
 
 For optional Google Scholar support (captcha-prone, best-effort):
 
@@ -43,7 +49,7 @@ Stage 1: build boolean queries (pure, offline)
 Stage 2: fetch from each source, dedupe, optionally download PDFs
         │
         ▼
-   papers.jsonl
+   papers.jsonl  (+ papers_failed_pdfs.csv when some PDFs are missing)
 ```
 
 Stage 1 doesn't touch the network — it just turns your synonyms + categories into search queries. Stage 2 is where everything network-related happens: hitting each source, respecting their rate limits, downloading PDFs, retrying when things go wrong.
@@ -88,11 +94,25 @@ See [`examples/paper_discovery/config.yaml`](https://github.com/EPFLiGHT/mmore/b
 python3 -m mmore paper-discovery --config-file examples/paper_discovery/config.yaml
 ```
 
-Progress is shown live with a tqdm bar while PDFs are being downloaded:
+You see one line per stage, a progress bar while it runs, and a summary at the end:
 
 ```
-PDFs:  42%|████▏     | 52/124 [01:15<01:43, 1.45s/paper, ok=42, cache=0, refused=8, failed=2]
+▸ Paper Discovery 📄  Find papers for your keywords · sources: openalex, europepmc, arxiv
+  Searching ━━━━━━━━━━━━━━━━━━━━━━━━  6/6 search 100% 0:00:15  arxiv · Humanitarian AI Search
+  PDFs      ━━━━━━━━━━━━━━━━━━━━━━━━ 20/20 paper  100% 0:02:39  ok=11 cache=0 refused=9 failed=9
+
+┌─ mmore ▸ Paper Discovery 📄 · done in 175.2s ─────────────────────────────────────┐
+│ sources: openalex, europepmc, arxiv   openalex      8 papers                       │
+│ PDFs: on                              europepmc     8 papers                       │
+│                                       arxiv         8 papers                       │
+│                                       unique        20 (4 duplicates removed)      │
+│                                       full text     11 papers · 9 without          │
+│                                       to download   results/papers_failed_pdfs.csv │
+│                                       output        results/papers.jsonl           │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Set `MMORE_VERBOSE=1` to also see each search and its result count.
 
 Press **Ctrl+C** at any time — the pipeline catches the interrupt and writes whatever it has so far to `output_file` before exiting.
 
@@ -101,7 +121,7 @@ Press **Ctrl+C** at any time — the pipeline catches the interrupt and writes w
 A JSONL file — one `Paper` record per line. Example line:
 
 ```json
-{"title": "A foundation model for humanitarian response", "authors": ["Ada Lovelace", "Alan Turing"], "url": "https://arxiv.org/pdf/2401.00001.pdf", "doi": "10.1000/xyz123", "candidate_urls": ["https://arxiv.org/pdf/2401.00001.pdf", "https://publisher.example.org/article/xyz123"], "abstract": "We introduce …", "year": 2024, "extracted_text": "<full PDF text>", "source": "arxiv", "search_category": "Humanitarian AI Search"}
+{"title": "A foundation model for humanitarian response", "authors": ["Ada Lovelace", "Alan Turing"], "url": "https://arxiv.org/pdf/2401.00001.pdf", "doi": "10.1000/xyz123", "candidate_urls": ["https://arxiv.org/pdf/2401.00001.pdf", "https://publisher.example.org/article/xyz123"], "abstract": "We introduce …", "year": 2024, "extracted_text": "<full PDF text>", "source": "arxiv", "search_category": "Humanitarian AI Search", "pdf_status": "downloaded", "pdf_http_status": 200}
 ```
 
 Line-per-record makes the file streamable (read one paper at a time), diff-friendly, and easy to append to. Any JSONL-aware tool (`jq`, `pandas.read_json(lines=True)`, mmore's `MultimodalSample.from_jsonl`) can consume it directly.
@@ -109,6 +129,8 @@ Line-per-record makes the file streamable (read one paper at a time), diff-frien
 Fields are **nullable on purpose** — sources differ in what they return. `null` means "we don't know."
 
 `candidate_urls` lists every known link to the paper, best first. `url` is the first one. When the same paper comes from several sources, their links are merged into one record.
+
+`pdf_status` says what happened to the PDF (see *PDF downloads* below), and `pdf_http_status` is the last HTTP status seen. Both are `null` when `download_pdfs` is off.
 
 ## ⚙️ Configuration knobs
 
@@ -142,17 +164,15 @@ user_agent: "my-lab-pipeline/1.0 (mailto:alice@example.com)"
 
 The default just identifies mmore + the repo URL, which works but doesn't tell anyone who *you* are.
 
-## 💾 PDF caching
+## 📥 PDF downloads
 
-`pdf_dir` is reused across runs. Each PDF is saved under a hash of the paper's DOI, or of its URL when there is no DOI. If that file already exists and is a real PDF, the download is skipped. If it isn't a real PDF, it is deleted and downloaded again.
-
-A paper only counts as a success if text was extracted from it. The summary line at the end of a run shows the split:
+Each paper's links are tried in order until one gives a PDF. A paper only counts as a success if text was extracted from it. The log line at the end of the PDF stage shows the split:
 
 ```
 PDF download: 108/124 succeeded (45 cached, 63 fresh). Not downloaded: 12 refused, 2 not found, 1 timeout, 1 no text
 ```
 
-Only the outcomes that happened are listed:
+Only the outcomes that happened are listed. Each paper's `pdf_status` uses the same names, with `_` instead of spaces:
 
 | Outcome | Meaning |
 |---|---|
@@ -171,7 +191,11 @@ Only the outcomes that happened are listed:
 
 Timeouts, rate limits and server errors are retried twice, waiting longer each time. A `Retry-After` header is honoured.
 
-> Caches from versions before this naming change aren't reused. Those PDFs are downloaded again.
+## 💾 PDF caching
+
+`pdf_dir` is reused across runs. Each PDF is saved under a hash of the paper's DOI, or of its URL when there is no DOI. If that file already exists and is a real PDF, the download is skipped. If it isn't a real PDF, it is deleted and downloaded again.
+
+> Caches made before DOI-based names aren't reused. Those PDFs are downloaded once more.
 
 This makes interrupted runs cheap to resume — every PDF that landed on disk before Ctrl+C is reused, only the missing ones are fetched.
 
@@ -193,7 +217,7 @@ Both show up as `refused` in the summary line, but they have completely differen
 
 **2. You have access, but the publisher blocks automated tools.** This is the common one, and it surprises people. Publishers like Wiley, ACM, and Science return `403` to anything that doesn't look like a browser, *regardless of whether your institution subscribes*. You can click the same link in your browser and get the PDF, then watch the pipeline get refused for the identical URL.
 
-mmore does **not** work around this by pretending to be a browser. Spoofing the User-Agent violates most publishers' terms of service, and a spoofed default would get the project's identifier blocklisted for every user of the library. That's a deliberate choice, not an oversight.
+mmore does **not** work around this by pretending to be a browser. Spoofing the User-Agent violates most publishers' terms of service, and a spoofed default would get the project's identifier blocklisted for every user of the library. That's a deliberate choice, not an oversight. If you have an agreement with a publisher, such as a registered crawler, set `user_agent` to what they require. That's your responsibility, not a library default.
 
 ### How your institution grants access matters
 
@@ -218,6 +242,22 @@ cannot log in for you.
 
 There is no headless workaround for that today. The pipeline cannot complete a SAML or Shibboleth login.
 
+### Download the rest by hand
+
+When some PDFs are missing, the pipeline writes a list next to your output, e.g. `results/papers_failed_pdfs.csv`:
+
+| Column | What it is |
+|---|---|
+| `title` | The paper |
+| `status` | Why it failed, e.g. `refused` |
+| `http_status` | The last HTTP status, if any |
+| `link` | Open this in your browser. For papers with a DOI it's the `doi.org` link, which takes you to the publisher, where your institution's sign-in works |
+| `save_as` | Save the PDF to exactly this path |
+
+Then run the pipeline again. It finds the saved PDFs in the cache and extracts their text. The list is rewritten on every run, and removed once nothing is missing.
+
+Run from the same folder each time, so relative paths such as `pdf_dir` point to the same place.
+
 ### Skip PDFs entirely
 
 If full text isn't essential, this is the cheapest path and it always works:
@@ -237,15 +277,6 @@ Text extraction goes through the same PDF processor the rest of mmore uses, so y
 
 Start with `fast`. Only switch to `full` if you notice extraction is losing structure on the papers you care about.
 
-### Why we don't spoof the User-Agent
-
-A common workaround for publisher 403s is to set the `User-Agent` to a browser string (Chrome, Firefox, …). mmore does **not** do that by default for two reasons:
-
-1. It violates most publishers' terms of service.
-2. A baked-in spoofed UA gets the **library's** default identifier blocklisted on first abuse — for every downstream user.
-
-If you have a specific arrangement with a publisher (e.g. a registered crawler agreement), you can set `user_agent` to whatever they require. That's an opt-in you take responsibility for — not a default the library ships.
-
 ## 🔌 Feeding results into mmore's index / RAG
 
 If you plan to index the discovered papers or run RAG over them, you don't need to send them back through `mmore process`. Ask the pipeline to write an extra output file in mmore's canonical `MultimodalSample` shape:
@@ -259,7 +290,7 @@ Every paper is converted to a `MultimodalSample`:
 - **`text`** — the extracted PDF body if we downloaded it, otherwise the abstract, otherwise the title.
 - **`metadata.file_path`** — points at the cached PDF when we have one.
 - **`metadata.processor_type`** — always `"paper_discovery"`, so downstream filters can recognise the source.
-- **`metadata.extra`** — carries the paper-specific fields (title, authors, year, source, url, search_category, abstract).
+- **`metadata.extra`** — carries the paper-specific fields (title, authors, year, source, url, doi, candidate_urls, search_category, pdf_status, abstract).
 
 The resulting JSONL is a drop-in input for the post-process, index, and RAG pipelines. The default `papers.jsonl` output is still written the same way alongside it.
 
@@ -272,8 +303,12 @@ from mmore.paper_discovery import PaperDiscoveryConfig, PaperDiscoveryPipeline
 from mmore.utils import load_config
 
 config = load_config("examples/paper_discovery/config.yaml", PaperDiscoveryConfig)
-papers = PaperDiscoveryPipeline(config).run()
+pipeline = PaperDiscoveryPipeline(config)
+papers = pipeline.run()
 print(f"Got {len(papers)} papers")
+print(pipeline.summary())  # the rows of the end-of-run card
+
+missing = [p for p in papers if p.pdf_status not in (None, "downloaded", "cached")]
 ```
 
 Or compose Stage 1 alone (no network) for testing:

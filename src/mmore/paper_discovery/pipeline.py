@@ -1,5 +1,6 @@
 """End-to-end orchestrator: synonyms + categories -> deduplicated papers.jsonl."""
 
+import csv
 import json
 import logging
 from collections import Counter
@@ -8,7 +9,7 @@ from pathlib import Path
 import yaml
 from dacite import from_dict
 
-from ..ux import progress
+from ..ux import plural, progress
 from .boolean import build_boolean_queries, load_synonyms
 from .config import CategoriesFile, PaperDiscoveryConfig
 from .pdf import (
@@ -33,6 +34,11 @@ class PaperDiscoveryPipeline:
 
     def __init__(self, config: PaperDiscoveryConfig):
         self.config = config
+        # Filled in by `run`, for the end-of-run summary.
+        self.found: Counter[str] = Counter()  # papers per source, before dedupe
+        self.n_unique = 0
+        self.pdf_counts: Counter[PdfStatus] = Counter()
+        self.failed_list: Path | None = None
 
     def run(self) -> list[Paper]:
         """Run both stages and return the deduplicated papers.
@@ -44,16 +50,14 @@ class PaperDiscoveryPipeline:
         synonyms = load_synonyms(cfg.synonyms_path)
         categories = _load_categories(cfg.categories_path)
         queries = build_boolean_queries(synonyms, categories)
-        logger.info("Built %d category queries", len(queries))
+        logger.debug("Built %d category queries", len(queries))
 
         all_papers: list[Paper] = []
         deduped: list[Paper] = []
         try:
-            for q in queries:
-                all_papers.extend(self._fetch_one(q))
-
+            self._search(queries, all_papers)
             deduped = _dedupe(all_papers)
-            logger.info(
+            logger.debug(
                 "After dedupe: %d papers (from %d)", len(deduped), len(all_papers)
             )
 
@@ -67,33 +71,64 @@ class PaperDiscoveryPipeline:
                 cfg.output_file,
             )
 
+        self.n_unique = len(deduped)
         self._write_output(deduped)
         return deduped
 
-    def _fetch_one(self, query: CategoryQuery) -> list[Paper]:
+    def summary(self) -> dict[str, object]:
+        """Rows for the end-of-run card: what was found and where it went."""
+        rows: dict[str, object] = {
+            src: plural(n, "paper") for src, n in self.found.items()
+        }
+        duplicates = sum(self.found.values()) - self.n_unique
+        rows["unique"] = f"{self.n_unique} ({duplicates} duplicates removed)"
+        if self.pdf_counts:
+            with_text = sum(self.pdf_counts[s] for s in SUCCESS)
+            without = sum(self.pdf_counts.values()) - with_text
+            rows["full text"] = f"{with_text} papers · {without} without"
+        if self.failed_list:
+            rows["to download"] = str(self.failed_list)
+        rows["output"] = self.config.output_file
+        return rows
+
+    def _search(self, queries: list[CategoryQuery], out: list[Paper]) -> None:
+        """Run every query on every source, adding results to `out`."""
         cfg = self.config
-        out: list[Paper] = []
-        for src_name in cfg.sources:
-            extra: dict = {}
-            if src_name == "arxiv":
-                if cfg.arxiv_category_map:
-                    extra["category_map"] = cfg.arxiv_category_map
-                extra["enable_pair_query"] = cfg.arxiv_enable_pair_query
-            adapter = get_adapter(
-                src_name,
-                user_agent=cfg.user_agent,
-                max_pages=cfg.max_pages,
-                max_results=cfg.max_results,
-                **extra,
-            )
-            logger.info("Searching %s for %r", src_name, query.combination_title)
-            papers = adapter.search(query.boolean_combination, query.combination_title)
-            logger.info("%s returned %d papers", src_name, len(papers))
-            out.extend(papers)
-        return out
+        total = len(queries) * len(cfg.sources)
+        with progress(total=total, desc="Searching", unit="search") as bar:
+            for query in queries:
+                for src_name in cfg.sources:
+                    bar.set_postfix_str(f"{src_name} · {query.combination_title}")
+                    papers = self._search_source(src_name, query)
+                    self.found[src_name] += len(papers)
+                    out.extend(papers)
+                    bar.update()
+
+    def _search_source(self, src_name: str, query: CategoryQuery) -> list[Paper]:
+        cfg = self.config
+        extra: dict = {}
+        if src_name == "arxiv":
+            if cfg.arxiv_category_map:
+                extra["category_map"] = cfg.arxiv_category_map
+            extra["enable_pair_query"] = cfg.arxiv_enable_pair_query
+        adapter = get_adapter(
+            src_name,
+            user_agent=cfg.user_agent,
+            max_pages=cfg.max_pages,
+            max_results=cfg.max_results,
+            **extra,
+        )
+        papers = adapter.search(query.boolean_combination, query.combination_title)
+        logger.debug(
+            "%s returned %d papers for %r",
+            src_name,
+            len(papers),
+            query.combination_title,
+        )
+        return papers
 
     def _enrich_with_pdf_text(self, papers: list[Paper]) -> None:
-        counts: Counter[PdfStatus] = Counter()
+        counts = self.pdf_counts
         with progress(total=len(papers), desc="PDFs", unit="paper") as bar:
             for paper in papers:
                 counts[self._fetch_text(paper)] += 1
@@ -104,17 +139,21 @@ class PaperDiscoveryPipeline:
                     f"refused={counts[PdfStatus.REFUSED]} failed={failed}"
                 )
                 bar.update()
-        _log_pdf_summary(counts)
+        self.failed_list = self._write_failed_list(papers)
+        _log_pdf_summary(counts, self.failed_list)
 
     def _fetch_text(self, paper: Paper) -> PdfStatus:
-        """Get the paper's PDF from the cache or the web, and extract its text."""
+        """Get the paper's PDF from the cache or the web, and extract its text.
+
+        Records the outcome on the paper and returns it.
+        """
         cfg = self.config
         key = paper.cache_key()
         if key is None:
-            return PdfStatus.NO_URL
+            return _set_status(paper, PdfStatus.NO_URL)
 
         pdf_path: str | None = None
-        status = PdfStatus.DOWNLOADED
+        status, http_status = PdfStatus.DOWNLOADED, None
         cached_path = expected_pdf_path(key, cfg.pdf_dir)
         if not cfg.force_redownload and cached_path.exists():
             if is_pdf_file(cached_path):
@@ -127,12 +166,55 @@ class PaperDiscoveryPipeline:
         if pdf_path is None:
             result = self._download_first(paper, key)
             if not result.path:
-                return result.outcome
-            pdf_path = result.path
+                return _set_status(paper, result.outcome, result.status)
+            pdf_path, http_status = result.path, result.status
 
         paper.extracted_text = extract_text(pdf_path, mode=cfg.pdf_extractor) or None
         # Only a PDF that gave us text counts as a success.
-        return status if paper.extracted_text else PdfStatus.NO_TEXT
+        if not paper.extracted_text:
+            status = PdfStatus.NO_TEXT
+        return _set_status(paper, status, http_status)
+
+    def _write_failed_list(self, papers: list[Paper]) -> Path | None:
+        """Write a CSV of papers to download by hand. None if there are none.
+
+        Each row has a link to open in a browser and the exact path to save
+        the PDF to. The next run finds the saved file in the cache.
+        """
+        cfg = self.config
+        out = Path(cfg.output_file)
+        path = out.with_name(f"{out.stem}_failed_pdfs.csv")
+        rows = []
+        for p in papers:
+            key, status = p.cache_key(), p.pdf_status
+            if status is None or status not in MANUAL_DOWNLOAD or key is None:
+                continue
+            # The DOI link resolves to the publisher's page, where a browser
+            # can use the institution's sign-in.
+            urls = p.download_urls()
+            link = f"https://doi.org/{p.doi}" if p.doi else urls[0]
+            rows.append(
+                {
+                    "title": p.title or "",
+                    "status": status.value,
+                    "http_status": p.pdf_http_status or "",
+                    "link": link,
+                    "save_as": str(expected_pdf_path(key, cfg.pdf_dir).resolve()),
+                }
+            )
+
+        if not rows:
+            path.unlink(missing_ok=True)  # don't leave last run's list behind
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # So the user can save straight into it.
+        Path(cfg.pdf_dir).mkdir(parents=True, exist_ok=True)
+        # utf-8-sig so Excel shows accented titles correctly.
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        return path
 
     def _download_first(self, paper: Paper, key: str) -> DownloadResult:
         """Try each of the paper's URLs until one gives a PDF.
@@ -168,7 +250,7 @@ class PaperDiscoveryPipeline:
         with open(out_path, "w", encoding="utf-8") as f:
             for paper in papers:
                 f.write(json.dumps(paper.to_dict(), ensure_ascii=False) + "\n")
-        logger.info("Wrote %d papers to %s", len(papers), out_path)
+        logger.debug("Wrote %d papers to %s", len(papers), out_path)
 
         if cfg.multimodal_output_file:
             self._write_multimodal_jsonl(papers, cfg.multimodal_output_file)
@@ -194,7 +276,7 @@ class PaperDiscoveryPipeline:
             )
             samples.append(p.to_multimodal_sample(pdf_path=pdf_path))
         MultimodalSample.to_jsonl(str(out_path), samples)
-        logger.info(
+        logger.debug(
             "Wrote %d MultimodalSample records to %s (mmore-native shape)",
             len(samples),
             out_path,
@@ -207,8 +289,18 @@ SUCCESS = {PdfStatus.DOWNLOADED, PdfStatus.CACHED}
 # A landing page with no PDF link says less than the publisher refusing us.
 TELLING_FAILURES = (PdfStatus.LOGIN_PAGE, PdfStatus.REFUSED, PdfStatus.RATE_LIMITED)
 
+# Failures a person can often fix by downloading the PDF in a browser.
+MANUAL_DOWNLOAD = set(PdfStatus) - SUCCESS - {PdfStatus.NO_TEXT}
 
-def _log_pdf_summary(counts: "Counter[PdfStatus]") -> None:
+
+def _set_status(
+    paper: Paper, status: PdfStatus, http_status: int | None = None
+) -> PdfStatus:
+    paper.pdf_status, paper.pdf_http_status = status, http_status
+    return status
+
+
+def _log_pdf_summary(counts: "Counter[PdfStatus]", failed_list: Path | None) -> None:
     """One summary line, then a hint for each failure the user can act on."""
     succeeded = counts[PdfStatus.DOWNLOADED] + counts[PdfStatus.CACHED]
     failures = ", ".join(
@@ -243,10 +335,10 @@ def _log_pdf_summary(counts: "Counter[PdfStatus]") -> None:
         )
     if counts[PdfStatus.REFUSED]:
         logger.info(
-            "%d PDFs were refused by the publisher (401/402/403). Either "
-            "there is no subscription, or the publisher blocks automated "
-            "tools. Being on the VPN does not always help. Set "
-            "`download_pdfs: false` to keep metadata and abstracts only.",
+            "%d PDFs were refused by the publisher (401/402/403), after "
+            "trying free copies. Either there is no subscription, or the "
+            "publisher blocks automated tools. Being on the VPN does not "
+            "always help. Download them by hand (see below).",
             counts[PdfStatus.REFUSED],
         )
     if counts[PdfStatus.RATE_LIMITED]:
@@ -259,6 +351,13 @@ def _log_pdf_summary(counts: "Counter[PdfStatus]") -> None:
         logger.info(
             "%d PDFs timed out. Raise `pdf_timeout` for slow publishers or proxies.",
             counts[PdfStatus.TIMEOUT],
+        )
+    if failed_list:
+        logger.info(
+            "To add the missing PDFs by hand: open each link in %s in your "
+            "browser, save the PDF to the path in its `save_as` column, then "
+            "run again. Saved PDFs are picked up automatically.",
+            failed_list,
         )
 
 

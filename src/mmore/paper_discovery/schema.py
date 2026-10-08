@@ -71,6 +71,9 @@ class Paper:
     extracted_text: str | None = None
     source: SourceName | None = None
     search_category: str | None = None
+    # What happened to the PDF. None when PDFs are off.
+    pdf_status: PdfStatus | None = None
+    pdf_http_status: int | None = None  # last HTTP status, if any
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +87,8 @@ class Paper:
             "extracted_text": self.extracted_text,
             "source": self.source,
             "search_category": self.search_category,
+            "pdf_status": self.pdf_status,
+            "pdf_http_status": self.pdf_http_status,
         }
 
     def download_urls(self) -> list[str]:
@@ -126,6 +131,7 @@ class Paper:
                 "doi": self.doi,
                 "candidate_urls": self.candidate_urls,
                 "search_category": self.search_category,
+                "pdf_status": self.pdf_status,
                 "abstract": self.abstract,
             }.items()
             if v is not None
